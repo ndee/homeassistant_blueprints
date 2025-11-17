@@ -1,0 +1,49 @@
+blueprint:
+  name: Auto Light On (Motion + Brightness)
+  description: Turns on lights in an area when motion is detected and the brightness is below a set threshold.
+  domain: automation
+  input:
+    occupancy_sensor:
+      name: Occupancy Sensor
+      description: The binary sensor that detects presence/motion (e.g., binary_sensor.detection_area_studio_occupancy_status)
+      selector:
+        entity:
+          domain: binary_sensor
+    lux_sensor:
+      name: Brightness Sensor
+      description: The sensor measuring illuminance in lux (e.g., sensor.hue_motion_sensor_1_beleuchtungsstarke_3)
+      selector:
+        entity:
+          domain: sensor
+    threshold_helper:
+      name: Brightness Threshold
+      description: Input number defining the maximum lux value to turn on lights (e.g., input_number.leuchten_helligkeit_grenzwert)
+      selector:
+        entity:
+          domain: input_number
+    light_area:
+      name: Light Area
+      description: The area where the lights should be turned on (e.g., studio)
+      selector:
+        area:
+trigger:
+  - platform: state
+    entity_id: !input occupancy_sensor
+    from: "off"
+    to: "on"
+  - platform: state
+    entity_id: !input threshold_helper
+  - platform: state
+    entity_id: !input lux_sensor
+condition:
+  - condition: numeric_state
+    entity_id: !input lux_sensor
+    below: !input threshold_helper
+  - condition: state
+    entity_id: !input occupancy_sensor
+    state: "on"
+action:
+  - service: light.turn_on
+    target:
+      area_id: !input light_area
+mode: single
