@@ -16,7 +16,7 @@ blueprint:
         entity:
           domain: sensor
     threshold_helper:
-      name: Brightness Threshold
+      name: Brightness Threshold (deprecated)
       description: Input number defining the lux threshold above which lights can be turned off (e.g., input_number.leuchten_helligkeit_grenzwert)
       selector:
         entity:
@@ -36,14 +36,9 @@ trigger:
     entity_id: !input lux_sensor
 
 condition:
-  - condition: or
-    conditions:
-      - condition: numeric_state
-        entity_id: !input lux_sensor
-        above: !input threshold_helper
-      - condition: state
-        entity_id: !input occupancy_sensor
-        state: "off"
+  - condition: state
+    entity_id: !input occupancy_sensor
+    state: "off"
 
 action:
   - service: light.turn_off
