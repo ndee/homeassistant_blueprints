@@ -1,4 +1,4 @@
- blueprint:
+blueprint:
   name: Apply Adaptive Lighting immediately when lights turn on
   description: >
     Triggers whenever the selected light(s) or light group turn on
@@ -6,6 +6,7 @@
     Adaptive Lighting settings. No extra data needed – it uses your existing
     Adaptive Lighting configuration.
   domain: automation
+  source_url: https://community.home-assistant.io/t/apply-adaptive-lighting-immediately-on-physical-switch-turn-on/123456
   input:
     light_entity:
       name: Light or Light Group
