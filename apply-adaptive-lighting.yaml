@@ -1,0 +1,43 @@
+ blueprint:
+  name: Apply Adaptive Lighting immediately when lights turn on
+  description: >
+    Triggers whenever the selected light(s) or light group turn on
+    (e.g., via physical Hue wall switch) and immediately applies the current
+    Adaptive Lighting settings. No extra data needed – it uses your existing
+    Adaptive Lighting configuration.
+  domain: automation
+  input:
+    light_entity:
+      name: Light or Light Group
+      description: The light entity or group that is controlled by your physical switch.
+      selector:
+        entity:
+          domain: light
+          multiple: true
+
+    adaptive_lighting_switch:
+      name: Adaptive Lighting Switch
+      description: The Adaptive Lighting switch entity (e.g., switch.adaptive_lighting_living_room).
+      selector:
+        entity:
+          domain: switch
+          integration: adaptive_lighting
+
+trigger:
+  - platform: state
+    entity_id: !input light_entity
+    to: "on"
+    from: "off"  # Ensures it only triggers when actually turning on
+
+condition:
+  - condition: state
+    entity_id: !input adaptive_lighting_switch
+    state: "on"
+
+action:
+  - service: adaptive_lighting.apply
+    target:
+      entity_id: !input adaptive_lighting_switch
+
+mode: single
+max_exceeded: silent
