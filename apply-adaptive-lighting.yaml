@@ -1,5 +1,5 @@
 blueprint:
-  name: Apply Adaptive Lighting immediately when lights turn on
+  name: Apply Adaptive Lighting
   description: >
     Triggers whenever the selected light(s) or light group turn on
     (e.g., via physical Hue wall switch) and immediately applies the current
