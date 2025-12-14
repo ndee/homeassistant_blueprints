@@ -1,0 +1,39 @@
+blueprint:
+  name: Hue Wall Switch Toggle Light
+  description: Toggles a light (or multiple lights) when a short_release event is received from a Philips Hue wall switch (integrated via Philips Hue bridge).
+  domain: automation
+  input:
+    switch_id:
+      name: Hue Wall Switch ID
+      description: The 'id' from the hue_event data (e.g., hue_wall_switch_treppe_1_og_button). This identifies the specific switch.
+      selector:
+        text:
+    switch_subtype:
+      name: Button Subtype (optional)
+      description: The 'subtype' from the hue_event data (e.g., 1). Leave empty if you don't need to distinguish between multiple buttons on the same switch.
+      default: ""
+      selector:
+        text:
+    target_light:
+      name: Light to Toggle
+      description: The light entity (or entities) to toggle.
+      selector:
+        target:
+          entity:
+            domain: light
+
+trigger:
+  - platform: event
+    event_type: hue_event
+    event_data:
+      type: short_release
+      id: !input switch_id
+      subtype: !input switch_subtype if !input switch_subtype else any  # If no subtype provided, match any
+
+condition: []
+
+action:
+  - service: light.toggle
+    target: !input target_light
+
+mode: single
