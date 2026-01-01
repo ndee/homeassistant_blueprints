@@ -8,7 +8,6 @@ blueprint:
     and unnecessary triggers.
   domain: automation
   source_url: https://community.home-assistant.io/t/apply-adaptive-lighting-immediately-on-physical-switch-turn-on/123456
-  version: 2.0.0
   input:
     light_entity:
       name: Light or Light Group
