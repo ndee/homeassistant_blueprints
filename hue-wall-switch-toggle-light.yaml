@@ -28,9 +28,14 @@ trigger:
     event_data:
       type: short_release
       id: !input switch_id
-      subtype: !input switch_subtype if !input switch_subtype else any  # If no subtype provided, match any
 
-condition: []
+variables:
+  switch_subtype: !input switch_subtype
+
+condition:
+  - condition: template
+    value_template: >
+      {{ trigger.event.data.subtype == (switch_subtype | int) or switch_subtype == "" }}
 
 action:
   - service: light.toggle
