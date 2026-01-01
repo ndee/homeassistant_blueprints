@@ -7,7 +7,6 @@ blueprint:
     is fully responsive. Includes safeguards against race conditions
     and unnecessary triggers.
   domain: automation
-  version: 2.0.0
   input:
     light_entity:
       name: Light or Light Group
