@@ -1,0 +1,205 @@
+blueprint:
+  name: Auto Light (Occupancy + Brightness)
+  description: >
+    Automatically turns lights on/off based on occupancy and brightness.
+    Supports lux sensors or sun elevation for brightness detection with
+    hysteresis to prevent flickering. Configurable off-delay prevents
+    lights from turning off immediately when motion stops.
+  domain: automation
+  input:
+    occupancy_sensor:
+      name: Occupancy Sensor
+      description: Binary sensor that detects presence/motion (e.g., binary_sensor.detection_area_studio_occupancy_status)
+      selector:
+        entity:
+          domain: binary_sensor
+
+    lights:
+      name: Lights
+      description: The lights to control (supports entities, devices, areas, or labels)
+      selector:
+        target:
+          entity:
+            domain: light
+
+    auto_on_enabled:
+      name: Enable Auto ON
+      description: Automatically turn lights on when occupancy is detected and brightness is low
+      default: true
+      selector:
+        boolean:
+
+    auto_off_enabled:
+      name: Enable Auto OFF
+      description: Automatically turn lights off when no occupancy or brightness is high
+      default: true
+      selector:
+        boolean:
+
+    brightness_mode:
+      name: Brightness Detection Mode
+      description: Choose how to determine if lights are needed
+      default: lux
+      selector:
+        select:
+          options:
+            - label: Lux Sensor (indoor or outdoor)
+              value: lux
+            - label: Sun Elevation
+              value: sun
+
+    lux_sensor:
+      name: Lux Sensor
+      description: Sensor measuring illuminance in lux (required for lux mode, ignored for sun mode)
+      default: ""
+      selector:
+        entity:
+          domain: sensor
+
+    lux_threshold_on:
+      name: Turn ON Below (lux)
+      description: Turn on lights when brightness is below this value
+      default: 50
+      selector:
+        number:
+          min: 0
+          max: 1000
+          step: 5
+          unit_of_measurement: lx
+          mode: slider
+
+    lux_threshold_off:
+      name: Turn OFF Above (lux)
+      description: Turn off lights when brightness exceeds this value (should be higher than ON threshold to prevent flickering)
+      default: 100
+      selector:
+        number:
+          min: 0
+          max: 1000
+          step: 5
+          unit_of_measurement: lx
+          mode: slider
+
+    sun_elevation_threshold:
+      name: Sun Elevation Threshold
+      description: Turn on lights when sun is below this elevation in degrees (used in sun mode)
+      default: 3
+      selector:
+        number:
+          min: -90
+          max: 90
+          step: 1
+          unit_of_measurement: °
+          mode: slider
+
+    off_delay:
+      name: Turn OFF Delay
+      description: Wait this many seconds after motion stops before turning off lights (0 = immediate)
+      default: 0
+      selector:
+        number:
+          min: 0
+          max: 900
+          step: 30
+          unit_of_measurement: seconds
+          mode: slider
+
+variables:
+  auto_on_enabled: !input auto_on_enabled
+  auto_off_enabled: !input auto_off_enabled
+  brightness_mode: !input brightness_mode
+  lux_sensor: !input lux_sensor
+  lux_on: !input lux_threshold_on
+  lux_off: !input lux_threshold_off
+  sun_threshold: !input sun_elevation_threshold
+
+  # Compute whether brightness is low (lights should be on)
+  brightness_is_low: >
+    {% if brightness_mode == 'lux' %}
+      {% if lux_sensor != '' %}
+        {{ states(lux_sensor) | float(1000) < lux_on }}
+      {% else %}
+        false
+      {% endif %}
+    {% else %}
+      {{ state_attr('sun.sun', 'elevation') | float(90) < sun_threshold }}
+    {% endif %}
+
+  # Compute whether brightness is high (lights can be turned off)
+  brightness_is_high: >
+    {% if brightness_mode == 'lux' %}
+      {% if lux_sensor != '' %}
+        {{ states(lux_sensor) | float(0) > lux_off }}
+      {% else %}
+        false
+      {% endif %}
+    {% else %}
+      {{ state_attr('sun.sun', 'elevation') | float(-90) > sun_threshold }}
+    {% endif %}
+
+trigger:
+  # Trigger when occupancy changes
+  - platform: state
+    entity_id: !input occupancy_sensor
+    from: "off"
+    to: "on"
+    id: motion_detected
+  - platform: state
+    entity_id: !input occupancy_sensor
+    from: "on"
+    to: "off"
+    id: motion_cleared
+
+  # Trigger when lux sensor changes (for lux mode)
+  - platform: state
+    entity_id: !input lux_sensor
+    id: lux_changed
+
+  # Trigger when sun elevation changes (for sun mode)
+  - platform: state
+    entity_id: sun.sun
+    attribute: elevation
+    id: sun_changed
+
+  # Trigger when thresholds change
+  - platform: state
+    entity_id: !input lux_threshold_on
+    id: threshold_changed
+  - platform: state
+    entity_id: !input lux_threshold_off
+    id: threshold_changed
+
+action:
+  - choose:
+      # Turn ON: auto-on enabled AND occupancy detected AND brightness is low
+      - conditions:
+          - condition: template
+            value_template: "{{ auto_on_enabled }}"
+          - condition: state
+            entity_id: !input occupancy_sensor
+            state: "on"
+          - condition: template
+            value_template: "{{ brightness_is_low }}"
+        sequence:
+          - service: light.turn_on
+            target: !input lights
+
+      # Turn OFF: auto-off enabled AND (no occupancy OR brightness is high)
+      - conditions:
+          - condition: template
+            value_template: "{{ auto_off_enabled }}"
+          - condition: or
+            conditions:
+              - condition: state
+                entity_id: !input occupancy_sensor
+                state: "off"
+              - condition: template
+                value_template: "{{ brightness_is_high }}"
+        sequence:
+          - delay:
+              seconds: !input off_delay
+          - service: light.turn_off
+            target: !input lights
+
+mode: restart
+max_exceeded: silent
