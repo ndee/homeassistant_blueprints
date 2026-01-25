@@ -36,6 +36,22 @@ blueprint:
       selector:
         boolean:
 
+    sleep_mode_entity:
+      name: Sleep Mode (optional)
+      description: Input boolean for sleep mode - when ON, lights will only turn OFF automatically, never ON
+      default: sun.sun
+      selector:
+        entity:
+          domain: input_boolean
+
+    presence_mode_entity:
+      name: Presence Mode (optional)
+      description: Input boolean for presence - when ON (present), lights can turn on automatically. When OFF (away), lights only turn OFF, never ON
+      default: sun.sun
+      selector:
+        entity:
+          domain: input_boolean
+
     brightness_mode:
       name: Brightness Detection Mode
       description: Choose how to determine if lights are needed
@@ -107,12 +123,22 @@ blueprint:
 variables:
   auto_on_enabled: !input auto_on_enabled
   auto_off_enabled: !input auto_off_enabled
+  sleep_mode_entity: !input sleep_mode_entity
+  presence_mode_entity: !input presence_mode_entity
   brightness_mode: !input brightness_mode
   lux_sensor: !input lux_sensor
   lux_on: !input lux_threshold_on
   lux_off: !input lux_threshold_off
   sun_threshold: !input sun_elevation_threshold
   off_delay: !input off_delay
+
+  # Check if sleep mode is active
+  sleep_mode_active: >
+    {{ sleep_mode_entity != 'sun.sun' and is_state(sleep_mode_entity, 'on') }}
+
+  # Check if presence mode allows auto-on (not configured OR present)
+  presence_allows_on: >
+    {{ presence_mode_entity == 'sun.sun' or is_state(presence_mode_entity, 'on') }}
 
   # Compute whether brightness is low (lights should be on)
   brightness_is_low: >
@@ -164,10 +190,14 @@ trigger:
 
 action:
   - choose:
-      # Turn ON: auto-on enabled AND occupancy detected AND brightness is low
+      # Turn ON: auto-on enabled AND occupancy detected AND brightness is low AND NOT sleeping AND present
       - conditions:
           - condition: template
             value_template: "{{ auto_on_enabled }}"
+          - condition: template
+            value_template: "{{ not sleep_mode_active }}"
+          - condition: template
+            value_template: "{{ presence_allows_on }}"
           - condition: state
             entity_id: !input occupancy_sensor
             state: "on"
