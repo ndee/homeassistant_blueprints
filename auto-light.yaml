@@ -1,9 +1,11 @@
+```yaml
 blueprint:
-  name: Auto Light (Occupancy + Brightness)
+  name: Auto Light (Occupancy + Brightness) with Manual Switch Support
   description: >
     Automatically turns lights on/off based on occupancy and indoor brightness.
     Uses hysteresis (different on/off thresholds) to prevent flickering.
     Configurable off-delay prevents lights from turning off immediately when motion stops.
+    Extended with support for connected switches: auto-on after delay when switch turns off lights, and different auto-off delay when turned on via switch.
   domain: automation
   input:
     occupancy_sensor:
@@ -20,6 +22,22 @@ blueprint:
         target:
           entity:
             domain: light
+
+    connected_switches:
+      name: Connected Switches (optional)
+      description: Switches or sensors that manually control the lights. Use entities that change to 'on' for turn on, 'off' for turn off.
+      default: []
+      selector:
+        entity:
+          multiple: true
+
+    manual_mode_helper:
+      name: Manual Mode Helper (optional)
+      description: Input boolean to track manual on mode for different off delay. Required if using connected switches.
+      default: sun.sun
+      selector:
+        entity:
+          domain: input_boolean
 
     auto_on_enabled:
       name: Enable Auto ON
@@ -84,14 +102,38 @@ blueprint:
           mode: slider
 
     off_delay:
-      name: Turn OFF Delay
-      description: Wait this many seconds after motion stops before turning off lights (0 = immediate)
+      name: Turn OFF Delay (Auto)
+      description: Wait this many seconds after motion stops before turning off lights (0 = immediate) for auto on
       default: 0
       selector:
         number:
           min: 0
           max: 900
           step: 30
+          unit_of_measurement: seconds
+          mode: slider
+
+    manual_off_delay:
+      name: Turn OFF Delay (Manual)
+      description: Wait this many seconds after motion stops before turning off lights when manually turned on via switch
+      default: 300
+      selector:
+        number:
+          min: 0
+          max: 3600
+          step: 30
+          unit_of_measurement: seconds
+          mode: slider
+
+    auto_on_after_manual_off_delay:
+      name: Auto ON Delay after Switch OFF
+      description: Delay before automatically turning on after switch turns off the lights
+      default: 5
+      selector:
+        number:
+          min: 0
+          max: 300
+          step: 1
           unit_of_measurement: seconds
           mode: slider
 
@@ -104,6 +146,10 @@ variables:
   lux_on: !input lux_threshold_on
   lux_off: !input lux_threshold_off
   off_delay: !input off_delay
+  manual_mode_helper: !input manual_mode_helper
+  has_manual_helper: "{{ manual_mode_helper != 'sun.sun' }}"
+  manual_off_delay: !input manual_off_delay
+  auto_on_after_manual_off_delay: !input auto_on_after_manual_off_delay
 
   # Check if sleep mode is active
   sleep_mode_active: >
@@ -129,6 +175,12 @@ variables:
       false
     {% endif %}
 
+  manual_active: >
+    {{ has_manual_helper and is_state(manual_mode_helper, 'on') }}
+
+  off_delay_var: >
+    {{ manual_off_delay if manual_active else off_delay }}
+
 trigger:
   # Trigger when occupancy changes
   - platform: state
@@ -147,6 +199,16 @@ trigger:
     entity_id: !input lux_sensor
     id: lux_changed
 
+  # Triggers for connected switches
+  - platform: state
+    entity_id: !input connected_switches
+    to: "on"
+    id: switch_turned_on
+  - platform: state
+    entity_id: !input connected_switches
+    to: "off"
+    id: switch_turned_off
+
 action:
   - choose:
       # Turn ON: auto-on enabled AND occupancy detected AND brightness is low AND NOT sleeping AND present
@@ -163,6 +225,13 @@ action:
           - condition: template
             value_template: "{{ brightness_is_low }}"
         sequence:
+          - if:
+              - condition: template
+                value_template: "{{ has_manual_helper }}"
+            then:
+              - service: input_boolean.turn_off
+                target:
+                  entity_id: "{{ manual_mode_helper }}"
           - service: light.turn_on
             target: !input lights
 
@@ -180,12 +249,74 @@ action:
         sequence:
           - if:
               - condition: template
-                value_template: "{{ off_delay | int > 0 }}"
+                value_template: "{{ off_delay_var | int > 0 }}"
             then:
               - delay:
-                  seconds: "{{ off_delay | int }}"
+                  seconds: "{{ off_delay_var | int }}"
+          - if:
+              - condition: template
+                value_template: "{{ has_manual_helper }}"
+            then:
+              - service: input_boolean.turn_off
+                target:
+                  entity_id: "{{ manual_mode_helper }}"
           - service: light.turn_off
             target: !input lights
 
+      # Handle switch turned on: set manual mode
+      - conditions:
+          - condition: trigger
+            id: switch_turned_on
+        sequence:
+          - if:
+              - condition: template
+                value_template: "{{ has_manual_helper }}"
+            then:
+              - service: input_boolean.turn_on
+                target:
+                  entity_id: "{{ manual_mode_helper }}"
+
+      # Handle switch turned off: reset manual, delay, auto on if conditions
+      - conditions:
+          - condition: trigger
+            id: switch_turned_off
+        sequence:
+          - if:
+              - condition: template
+                value_template: "{{ has_manual_helper }}"
+            then:
+              - service: input_boolean.turn_off
+                target:
+                  entity_id: "{{ manual_mode_helper }}"
+          - if:
+              - condition: template
+                value_template: "{{ auto_on_after_manual_off_delay | int > 0 }}"
+            then:
+              - delay:
+                  seconds: "{{ auto_on_after_manual_off_delay | int }}"
+          - if:
+              - condition: template
+                value_template: "{{ auto_on_enabled }}"
+              - condition: template
+                value_template: "{{ not sleep_mode_active }}"
+              - condition: template
+                value_template: "{{ presence_allows_on }}"
+              - condition: state
+                entity_id: !input occupancy_sensor
+                state: "on"
+              - condition: template
+                value_template: "{{ brightness_is_low }}"
+            then:
+              - if:
+                  - condition: template
+                    value_template: "{{ has_manual_helper }}"
+                then:
+                  - service: input_boolean.turn_off
+                    target:
+                      entity_id: "{{ manual_mode_helper }}"
+              - service: light.turn_on
+                target: !input lights
+
 mode: restart
 max_exceeded: silent
+```
