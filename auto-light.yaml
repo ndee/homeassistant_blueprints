@@ -208,7 +208,8 @@ variables:
     {{ manual_off_delay if manual_active else off_delay }}
 
   off_duration_var: >
-    {{ off_delay_var | int | multiply(1) | timestamp_custom('%H:%M:%S', false) }}
+    {% set s = off_delay_var | int %}
+    {{ "{:02d}:{:02d}:{:02d}".format(s // 3600, (s % 3600) // 60, s % 60) }}
 
 trigger:
   # Trigger when occupancy changes
@@ -298,34 +299,35 @@ action:
               - motion_cleared
               - lux_changed
         sequence:
-          - if:
-              - condition: template
-                value_template: "{{ has_timer and off_delay_var | int > 0 }}"
-            then:
-              - service: timer.start
-                data:
-                  duration: "{{ off_duration_var }}"
-                target:
-                  entity_id: "{{ off_timer }}"
-            else:
-              - if:
+          - choose:
+              - conditions:
+                  - condition: template
+                    value_template: "{{ has_timer and off_delay_var | int > 0 }}"
+                sequence:
+                  - service: timer.start
+                    data:
+                      duration: "{{ off_duration_var }}"
+                    target:
+                      entity_id: "{{ off_timer }}"
+                  - stop: "Started timer for off"
+              - conditions:
                   - condition: template
                     value_template: "{{ off_delay_var | int > 0 }}"
-                then:
+                sequence:
                   - delay:
                       seconds: "{{ off_delay_var | int }}"
-          - if:
-              - condition: not
-                conditions:
-                  - condition: or
-                    conditions:
-                      - condition: state
-                        entity_id: !input occupancy_sensor
-                        state: "off"
-                      - condition: template
-                        value_template: "{{ brightness_is_high }}"
-            then:
-              - stop: "Off conditions no longer met"
+                  - if:
+                      - condition: not
+                        conditions:
+                          - condition: or
+                            conditions:
+                              - condition: state
+                                entity_id: !input occupancy_sensor
+                                state: "off"
+                              - condition: template
+                                value_template: "{{ brightness_is_high }}"
+                    then:
+                      - stop: "Off conditions no longer met"
           - if:
               - condition: template
                 value_template: "{{ has_manual_helper }}"
@@ -405,16 +407,16 @@ action:
               - service: light.turn_on
                 target: !input lights
 
-    # Cancel off timer on motion detected if active
-    - if:
-        - condition: trigger
-          id: motion_detected
-        - condition: template
-          value_template: "{{ has_timer and is_state(off_timer, 'active') }}"
-      then:
-        - service: timer.cancel
-          target:
-            entity_id: "{{ off_timer }}"
+  # Cancel off timer on motion detected if active
+  - if:
+      - condition: trigger
+        id: motion_detected
+      - condition: template
+        value_template: "{{ has_timer and is_state(off_timer, 'active') }}"
+    then:
+      - service: timer.cancel
+        target:
+          entity_id: "{{ off_timer }}"
 
 mode: restart
 max_exceeded: silent
