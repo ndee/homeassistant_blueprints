@@ -1,11 +1,9 @@
 blueprint:
-  name: Auto Light (Occupancy + Brightness) with Manual Switch Support
+  name: Auto Light (Occupancy + Brightness)
   description: >
     Automatically turns lights on/off based on occupancy and indoor brightness.
     Uses hysteresis (different on/off thresholds) to prevent flickering.
     Configurable off-delay prevents lights from turning off immediately when motion stops.
-    Extended with support for connected switches: auto-on after delay when switch turns off the lights (optional), and different auto-off delay when turned on via switch.
-    Manual override support via switches and helper for tracking mode.
   domain: automation
   input:
     occupancy_sensor:
@@ -23,37 +21,6 @@ blueprint:
           entity:
             domain: light
 
-    connected_switches:
-      name: Connected Switches (optional)
-      description: >
-        Entities that reflect manual control of the lights, such as binary sensors detecting physical switch actions or input booleans.
-        These should change to 'on' when manually turning lights on, and 'off' when turning off.
-        Do not select the light entities themselves, as this may cause loops.
-      default: []
-      selector:
-        entity:
-          multiple: true
-          domain:
-            - binary_sensor
-            - switch
-            - input_boolean
-
-    manual_mode_helper:
-      name: Manual Mode Helper (optional)
-      description: Input boolean to track if lights were turned on manually via switches. Create one in Helpers if using switches.
-      default: sun.sun
-      selector:
-        entity:
-          domain: input_boolean
-
-    off_timer:
-      name: Off Timer (optional)
-      description: Timer entity to handle the off delay. Allows cancellation if motion resumes. Create one in Helpers for better reliability.
-      default: sun.sun
-      selector:
-        entity:
-          domain: timer
-
     auto_on_enabled:
       name: Enable Auto ON
       description: Automatically turn lights on when occupancy is detected and brightness is low
@@ -64,13 +31,6 @@ blueprint:
     auto_off_enabled:
       name: Enable Auto OFF
       description: Automatically turn lights off when no occupancy or brightness is high
-      default: true
-      selector:
-        boolean:
-
-    enable_auto_on_after_switch_off:
-      name: Enable Auto ON after Switch OFF
-      description: Automatically turn lights back on after a delay if switch turns them off but conditions still require them on
       default: true
       selector:
         boolean:
@@ -124,8 +84,8 @@ blueprint:
           mode: slider
 
     off_delay:
-      name: Turn OFF Delay (Auto)
-      description: Wait this many seconds after conditions for off are met (for auto on mode). Used if no timer provided.
+      name: Turn OFF Delay
+      description: Wait this many seconds after motion stops before turning off lights (0 = immediate)
       default: 0
       selector:
         number:
@@ -135,47 +95,15 @@ blueprint:
           unit_of_measurement: seconds
           mode: slider
 
-    manual_off_delay:
-      name: Turn OFF Delay (Manual)
-      description: Wait this many seconds after conditions for off are met when manually turned on via switch
-      default: 300
-      selector:
-        number:
-          min: 0
-          max: 7200
-          step: 30
-          unit_of_measurement: seconds
-          mode: slider
-
-    auto_on_after_manual_off_delay:
-      name: Auto ON Delay after Switch OFF
-      description: Delay before automatically turning on after switch turns off the lights
-      default: 5
-      selector:
-        number:
-          min: 0
-          max: 300
-          step: 1
-          unit_of_measurement: seconds
-          mode: slider
-
 variables:
   auto_on_enabled: !input auto_on_enabled
   auto_off_enabled: !input auto_off_enabled
-  enable_auto_on_after_switch_off: !input enable_auto_on_after_switch_off
   sleep_mode_entity: !input sleep_mode_entity
   presence_mode_entity: !input presence_mode_entity
   lux_sensor: !input lux_sensor
   lux_on: !input lux_threshold_on
   lux_off: !input lux_threshold_off
   off_delay: !input off_delay
-  manual_mode_helper: !input manual_mode_helper
-  has_manual_helper: "{{ manual_mode_helper != 'sun.sun' }}"
-  has_switches: "{{ connected_switches | default([]) | length > 0 }}"
-  manual_off_delay: !input manual_off_delay
-  auto_on_after_manual_off_delay: !input auto_on_after_manual_off_delay
-  off_timer: !input off_timer
-  has_timer: "{{ off_timer != 'sun.sun' }}"
 
   # Check if sleep mode is active
   sleep_mode_active: >
@@ -187,7 +115,7 @@ variables:
 
   # Compute whether brightness is low (lights should be on)
   brightness_is_low: >
-    {% if lux_sensor != '' and lux_sensor != 'sun.sun' and states(lux_sensor) not in ['unavailable', 'unknown', 'none'] %}
+    {% if lux_sensor != '' and lux_sensor != 'sun.sun' %}
       {{ states(lux_sensor) | float(1000) < lux_on }}
     {% else %}
       false
@@ -195,21 +123,11 @@ variables:
 
   # Compute whether brightness is high (lights can be turned off)
   brightness_is_high: >
-    {% if lux_sensor != '' and lux_sensor != 'sun.sun' and states(lux_sensor) not in ['unavailable', 'unknown', 'none'] %}
+    {% if lux_sensor != '' and lux_sensor != 'sun.sun' %}
       {{ states(lux_sensor) | float(0) > lux_off }}
     {% else %}
       false
     {% endif %}
-
-  manual_active: >
-    {{ has_manual_helper and is_state(manual_mode_helper, 'on') }}
-
-  off_delay_var: >
-    {{ manual_off_delay if manual_active else off_delay }}
-
-  off_duration_var: >
-    {% set s = off_delay_var | int %}
-    {{ "{:02d}:{:02d}:{:02d}".format(s // 3600, (s % 3600) // 60, s % 60) }}
 
 trigger:
   # Trigger when occupancy changes
@@ -229,27 +147,6 @@ trigger:
     entity_id: !input lux_sensor
     id: lux_changed
 
-  # Triggers for connected switches (with debounce to ignore rapid flips)
-  - platform: state
-    entity_id: !input connected_switches
-    to: "on"
-    for:
-      seconds: 1
-    id: switch_turned_on
-  - platform: state
-    entity_id: !input connected_switches
-    to: "off"
-    for:
-      seconds: 1
-    id: switch_turned_off
-
-  # Trigger for off timer finished
-  - platform: event
-    event_type: timer.finished
-    event_data:
-      entity_id: !input off_timer
-    id: off_timer_finished
-
 action:
   - choose:
       # Turn ON: auto-on enabled AND occupancy detected AND brightness is low AND NOT sleeping AND present
@@ -266,24 +163,10 @@ action:
           - condition: template
             value_template: "{{ brightness_is_low }}"
         sequence:
-          - if:
-              - condition: template
-                value_template: "{{ has_timer and is_state(off_timer, 'active') }}"
-            then:
-              - service: timer.cancel
-                target:
-                  entity_id: "{{ off_timer }}"
-          - if:
-              - condition: template
-                value_template: "{{ has_manual_helper }}"
-            then:
-              - service: input_boolean.turn_off
-                target:
-                  entity_id: "{{ manual_mode_helper }}"
           - service: light.turn_on
             target: !input lights
 
-      # Start/Handle OFF: auto-off enabled AND (no occupancy OR brightness is high)
+      # Turn OFF: auto-off enabled AND (no occupancy OR brightness is high)
       - conditions:
           - condition: template
             value_template: "{{ auto_off_enabled }}"
@@ -294,129 +177,15 @@ action:
                 state: "off"
               - condition: template
                 value_template: "{{ brightness_is_high }}"
-          - condition: trigger
-            id:
-              - motion_cleared
-              - lux_changed
-        sequence:
-          - choose:
-              - conditions:
-                  - condition: template
-                    value_template: "{{ has_timer and off_delay_var | int > 0 }}"
-                sequence:
-                  - service: timer.start
-                    data:
-                      duration: "{{ off_duration_var }}"
-                    target:
-                      entity_id: "{{ off_timer }}"
-                  - stop: "Started timer for off"
-              - conditions:
-                  - condition: template
-                    value_template: "{{ off_delay_var | int > 0 }}"
-                sequence:
-                  - delay:
-                      seconds: "{{ off_delay_var | int }}"
-                  - if:
-                      - condition: not
-                        conditions:
-                          - condition: or
-                            conditions:
-                              - condition: state
-                                entity_id: !input occupancy_sensor
-                                state: "off"
-                              - condition: template
-                                value_template: "{{ brightness_is_high }}"
-                    then:
-                      - stop: "Off conditions no longer met"
-          - if:
-              - condition: template
-                value_template: "{{ has_manual_helper }}"
-            then:
-              - service: input_boolean.turn_off
-                target:
-                  entity_id: "{{ manual_mode_helper }}"
-          - service: light.turn_off
-            target: !input lights
-
-      # Handle off timer finished: check if still should off, then off
-      - conditions:
-          - condition: trigger
-            id: off_timer_finished
-          - condition: template
-            value_template: "{{ auto_off_enabled }}"
-          - condition: or
-            conditions:
-              - condition: state
-                entity_id: !input occupancy_sensor
-                state: "off"
-              - condition: template
-                value_template: "{{ brightness_is_high }}"
         sequence:
           - if:
               - condition: template
-                value_template: "{{ has_manual_helper }}"
-            then:
-              - service: input_boolean.turn_off
-                target:
-                  entity_id: "{{ manual_mode_helper }}"
-          - service: light.turn_off
-            target: !input lights
-
-      # Handle switch turned on: set manual mode if helper exists
-      - conditions:
-          - condition: trigger
-            id: switch_turned_on
-          - condition: template
-            value_template: "{{ has_switches and has_manual_helper }}"
-        sequence:
-          - service: input_boolean.turn_on
-            target:
-              entity_id: "{{ manual_mode_helper }}"
-
-      # Handle switch turned off: reset manual, delay, auto on if enabled and conditions met
-      - conditions:
-          - condition: trigger
-            id: switch_turned_off
-          - condition: template
-            value_template: "{{ has_switches }}"
-        sequence:
-          - if:
-              - condition: template
-                value_template: "{{ has_manual_helper }}"
-            then:
-              - service: input_boolean.turn_off
-                target:
-                  entity_id: "{{ manual_mode_helper }}"
-          - if:
-              - condition: template
-                value_template: "{{ enable_auto_on_after_switch_off and auto_on_after_manual_off_delay | int > 0 }}"
+                value_template: "{{ off_delay | int > 0 }}"
             then:
               - delay:
-                  seconds: "{{ auto_on_after_manual_off_delay | int }}"
-          - if:
-              - condition: template
-                value_template: "{{ enable_auto_on_after_switch_off and auto_on_enabled and not sleep_mode_active and presence_allows_on and is_state(!input occupancy_sensor, 'on') and brightness_is_low }}"
-            then:
-              - if:
-                  - condition: template
-                    value_template: "{{ has_manual_helper }}"
-                then:
-                  - service: input_boolean.turn_off
-                    target:
-                      entity_id: "{{ manual_mode_helper }}"
-              - service: light.turn_on
-                target: !input lights
-
-  # Cancel off timer on motion detected if active
-  - if:
-      - condition: trigger
-        id: motion_detected
-      - condition: template
-        value_template: "{{ has_timer and is_state(off_timer, 'active') }}"
-    then:
-      - service: timer.cancel
-        target:
-          entity_id: "{{ off_timer }}"
+                  seconds: "{{ off_delay | int }}"
+          - service: light.turn_off
+            target: !input lights
 
 mode: restart
 max_exceeded: silent
