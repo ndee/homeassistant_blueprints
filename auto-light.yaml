@@ -1,4 +1,3 @@
-```yaml
 blueprint:
   name: Auto Light (Occupancy + Brightness) with Manual Switch Support
   description: >
@@ -34,7 +33,7 @@ blueprint:
     manual_mode_helper:
       name: Manual Mode Helper (optional)
       description: Input boolean to track manual on mode for different off delay. Required if using connected switches.
-      default: sun.sun
+      default: null
       selector:
         entity:
           domain: input_boolean
@@ -56,7 +55,7 @@ blueprint:
     sleep_mode_entity:
       name: Sleep Mode (optional)
       description: Input boolean for sleep mode - when ON, lights will only turn OFF automatically, never ON
-      default: sun.sun
+      default: null
       selector:
         entity:
           domain: input_boolean
@@ -64,7 +63,7 @@ blueprint:
     presence_mode_entity:
       name: Presence Mode (optional)
       description: Input boolean for presence - when ON (present), lights can turn on automatically. When OFF (away), lights only turn OFF, never ON
-      default: sun.sun
+      default: null
       selector:
         entity:
           domain: input_boolean
@@ -72,7 +71,7 @@ blueprint:
     lux_sensor:
       name: Indoor Lux Sensor
       description: Sensor measuring indoor illuminance in lux
-      default: sun.sun
+      default: null
       selector:
         entity:
           domain: sensor
@@ -147,21 +146,21 @@ variables:
   lux_off: !input lux_threshold_off
   off_delay: !input off_delay
   manual_mode_helper: !input manual_mode_helper
-  has_manual_helper: "{{ manual_mode_helper != 'sun.sun' }}"
+  has_manual_helper: "{{ manual_mode_helper != none and manual_mode_helper != '' }}"
   manual_off_delay: !input manual_off_delay
   auto_on_after_manual_off_delay: !input auto_on_after_manual_off_delay
 
   # Check if sleep mode is active
   sleep_mode_active: >
-    {{ sleep_mode_entity != 'sun.sun' and is_state(sleep_mode_entity, 'on') }}
+    {{ sleep_mode_entity != none and sleep_mode_entity != '' and is_state(sleep_mode_entity, 'on') }}
 
   # Check if presence mode allows auto-on (not configured OR present)
   presence_allows_on: >
-    {{ presence_mode_entity == 'sun.sun' or is_state(presence_mode_entity, 'on') }}
+    {{ presence_mode_entity == none or presence_mode_entity == '' or is_state(presence_mode_entity, 'on') }}
 
   # Compute whether brightness is low (lights should be on)
   brightness_is_low: >
-    {% if lux_sensor != '' and lux_sensor != 'sun.sun' %}
+    {% if lux_sensor != none and lux_sensor != '' %}
       {{ states(lux_sensor) | float(1000) < lux_on }}
     {% else %}
       false
@@ -169,7 +168,7 @@ variables:
 
   # Compute whether brightness is high (lights can be turned off)
   brightness_is_high: >
-    {% if lux_sensor != '' and lux_sensor != 'sun.sun' %}
+    {% if lux_sensor != none and lux_sensor != '' %}
       {{ states(lux_sensor) | float(0) > lux_off }}
     {% else %}
       false
@@ -319,4 +318,3 @@ action:
 
 mode: restart
 max_exceeded: silent
-```
