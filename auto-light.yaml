@@ -54,11 +54,23 @@ blueprint:
 
     sleep_mode_entity:
       name: Sleep Mode (optional)
-      description: Input boolean for sleep mode - when ON, lights will only turn OFF automatically, never ON
+      description: Input boolean for sleep mode - when ON, lights will only turn OFF automatically, never ON. When activated, lights turn off after the configured delay.
       default: null
       selector:
         entity:
           domain: input_boolean
+
+    sleep_mode_off_delay:
+      name: Sleep Mode Turn OFF Delay (Seconds)
+      description: When sleep mode is activated, wait this many seconds before turning off the lights (0 = immediate)
+      default: 0
+      selector:
+        number:
+          min: 0
+          max: 300
+          step: 5
+          unit_of_measurement: seconds
+          mode: slider
 
     alarm_panel:
       name: Alarm Panel (optional)
@@ -143,6 +155,7 @@ variables:
   auto_on_enabled: !input auto_on_enabled
   auto_off_enabled: !input auto_off_enabled
   sleep_mode_entity: !input sleep_mode_entity
+  sleep_mode_off_delay: !input sleep_mode_off_delay
   alarm_panel: !input alarm_panel
   lux_sensor: !input lux_sensor
   lux_on: !input lux_threshold_on
@@ -212,6 +225,13 @@ trigger:
     entity_id: !input connected_switches
     to: "off"
     id: switch_turned_off
+
+  # Trigger when sleep mode is activated
+  - platform: state
+    entity_id: !input sleep_mode_entity
+    from: "off"
+    to: "on"
+    id: sleep_mode_activated
 
 action:
   - choose:
@@ -320,6 +340,27 @@ action:
                       entity_id: "{{ manual_mode_helper }}"
               - service: light.turn_on
                 target: !input lights
+
+      # Handle sleep mode activation: turn off lights after delay
+      - conditions:
+          - condition: trigger
+            id: sleep_mode_activated
+        sequence:
+          - if:
+              - condition: template
+                value_template: "{{ sleep_mode_off_delay | int > 0 }}"
+            then:
+              - delay:
+                  seconds: "{{ sleep_mode_off_delay | int }}"
+          - if:
+              - condition: template
+                value_template: "{{ has_manual_helper }}"
+            then:
+              - service: input_boolean.turn_off
+                target:
+                  entity_id: "{{ manual_mode_helper }}"
+          - service: light.turn_off
+            target: !input lights
 
 mode: restart
 max_exceeded: silent
