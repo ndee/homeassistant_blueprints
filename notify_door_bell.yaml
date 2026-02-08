@@ -1,0 +1,135 @@
+blueprint:
+  name: Doorbell Notification with Camera Image
+  description: >
+    Sends notifications to multiple targets when the doorbell rings.
+    Attaches the latest camera image from a Doorbird (or other) camera.
+    Supports various notification services like Signal, TV notifications, mobile apps, etc.
+  domain: automation
+  input:
+    doorbell_trigger:
+      name: Doorbell Trigger
+      description: Binary sensor or event entity that triggers when doorbell is pressed (e.g., binary_sensor.doorbird_front_door_button)
+      selector:
+        entity:
+          domain:
+            - binary_sensor
+            - event
+
+    camera_entity:
+      name: Camera Entity
+      description: The Doorbird camera entity to capture the image from
+      selector:
+        entity:
+          domain: camera
+
+    notify_targets:
+      name: Notification Targets
+      description: >
+        List of notification service targets (e.g., notify.signal_group, notify.living_room_tv, notify.mobile_app_phone).
+        Enter the full service name without the 'notify.' prefix.
+      selector:
+        text:
+          multiple: true
+
+    notification_title:
+      name: Notification Title
+      description: Title of the notification
+      default: "Doorbell"
+      selector:
+        text:
+
+    notification_message:
+      name: Notification Message
+      description: Message to send with the notification
+      default: "Someone is at the door!"
+      selector:
+        text:
+          multiline: true
+
+    image_filename:
+      name: Image Filename
+      description: Filename for the captured camera snapshot (stored in /config/www/)
+      default: "doorbell_snapshot.jpg"
+      selector:
+        text:
+
+variables:
+  camera_entity: !input camera_entity
+  notify_targets: !input notify_targets
+  notification_title: !input notification_title
+  notification_message: !input notification_message
+  image_filename: !input image_filename
+  # Build the local path and URL for the snapshot
+  snapshot_path: "/config/www/{{ image_filename }}"
+  snapshot_url: "/local/{{ image_filename }}"
+
+trigger:
+  # Trigger when doorbell binary sensor turns on
+  - platform: state
+    entity_id: !input doorbell_trigger
+    to: "on"
+    id: doorbell_pressed
+
+  # Also support event-based triggers (for event entities)
+  - platform: state
+    entity_id: !input doorbell_trigger
+    id: doorbell_event
+    not_from:
+      - "unavailable"
+      - "unknown"
+
+condition:
+  # Only proceed if the trigger was a doorbell press (state to 'on') or a new event
+  - condition: or
+    conditions:
+      - condition: trigger
+        id: doorbell_pressed
+      - condition: and
+        conditions:
+          - condition: trigger
+            id: doorbell_event
+          - condition: template
+            value_template: "{{ trigger.to_state.state != trigger.from_state.state }}"
+
+action:
+  # Step 1: Capture camera snapshot
+  - service: camera.snapshot
+    target:
+      entity_id: "{{ camera_entity }}"
+    data:
+      filename: "{{ snapshot_path }}"
+
+  # Step 2: Small delay to ensure image is saved
+  - delay:
+      milliseconds: 500
+
+  # Step 3: Send notifications to all configured targets
+  - repeat:
+      for_each: "{{ notify_targets }}"
+      sequence:
+        - service: "notify.{{ repeat.item }}"
+          data:
+            title: "{{ notification_title }}"
+            message: "{{ notification_message }}"
+            data:
+              # Image attachment for various notification services
+              image: "{{ snapshot_path }}"
+              # For mobile app notifications
+              attachment:
+                url: "{{ snapshot_url }}"
+                content_type: "image/jpeg"
+              # For Signal Messenger
+              attachments:
+                - "{{ snapshot_path }}"
+              # For Android TV / Fire TV notifications
+              fontsize: "medium"
+              position: "center"
+              duration: 10
+              transparency: "50%"
+              interrupt: true
+              # For generic image support
+              photo:
+                - file: "{{ snapshot_path }}"
+
+mode: single
+max_exceeded: silent
