@@ -6,14 +6,15 @@ blueprint:
     Supports various notification services like Signal, TV notifications, mobile apps, etc.
   domain: automation
   input:
-    doorbell_trigger:
-      name: Doorbell Trigger
-      description: Binary sensor or event entity that triggers when doorbell is pressed (e.g., binary_sensor.doorbird_front_door_button)
+    doorbell_event:
+      name: Doorbell Event Type
+      description: >
+        The event type fired when the doorbell is pressed.
+        For Doorbird, this is typically 'doorbird_{device_name}_doorbell'
+        (e.g., 'doorbird_front_door_doorbell').
+        Check Developer Tools > Events to find your event name.
       selector:
-        entity:
-          domain:
-            - binary_sensor
-            - event
+        text:
 
     camera_entity:
       name: Camera Entity
@@ -64,32 +65,9 @@ variables:
   snapshot_url: "/local/{{ image_filename }}"
 
 trigger:
-  # Trigger when doorbell binary sensor turns on
-  - platform: state
-    entity_id: !input doorbell_trigger
-    to: "on"
-    id: doorbell_pressed
-
-  # Also support event-based triggers (for event entities)
-  - platform: state
-    entity_id: !input doorbell_trigger
-    id: doorbell_event
-    not_from:
-      - "unavailable"
-      - "unknown"
-
-condition:
-  # Only proceed if the trigger was a doorbell press (state to 'on') or a new event
-  - condition: or
-    conditions:
-      - condition: trigger
-        id: doorbell_pressed
-      - condition: and
-        conditions:
-          - condition: trigger
-            id: doorbell_event
-          - condition: template
-            value_template: "{{ trigger.to_state.state != trigger.from_state.state }}"
+  # Trigger on doorbell event (e.g., doorbird_front_door_doorbell)
+  - platform: event
+    event_type: !input doorbell_event
 
 action:
   # Step 1: Capture camera snapshot
