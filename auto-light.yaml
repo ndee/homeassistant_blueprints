@@ -60,13 +60,16 @@ blueprint:
         entity:
           domain: input_boolean
 
-    presence_mode_entity:
-      name: Presence Mode (optional)
-      description: Input select for presence mode - when "Anwesend" (present), lights can turn on automatically. When "Abwesend" or "Verreist" (away), lights only turn OFF, never ON
+    alarm_panel:
+      name: Alarm Panel (optional)
+      description: >
+        Alarmo alarm control panel for presence mode.
+        When disarmed or armed_home/armed_night (someone is home), lights can turn on automatically.
+        When armed_away or armed_vacation (away), lights only turn OFF, never ON.
       default: null
       selector:
         entity:
-          domain: input_select
+          domain: alarm_control_panel
 
     lux_sensor:
       name: Indoor Lux Sensor
@@ -140,7 +143,7 @@ variables:
   auto_on_enabled: !input auto_on_enabled
   auto_off_enabled: !input auto_off_enabled
   sleep_mode_entity: !input sleep_mode_entity
-  presence_mode_entity: !input presence_mode_entity
+  alarm_panel: !input alarm_panel
   lux_sensor: !input lux_sensor
   lux_on: !input lux_threshold_on
   lux_off: !input lux_threshold_off
@@ -154,10 +157,11 @@ variables:
   sleep_mode_active: >
     {{ sleep_mode_entity != none and sleep_mode_entity != '' and is_state(sleep_mode_entity, 'on') }}
 
-  # Check if presence mode allows auto-on (not configured OR "Anwesend")
-  # "Abwesend" and "Verreist" both prevent auto-on
+  # Check if presence mode allows auto-on based on alarm panel state
+  # Allow auto-on when: not configured, disarmed, armed_home, or armed_night (someone is home)
+  # Prevent auto-on when: armed_away or armed_vacation (nobody home)
   presence_allows_on: >
-    {{ presence_mode_entity == none or presence_mode_entity == '' or is_state(presence_mode_entity, 'Anwesend') }}
+    {{ alarm_panel == none or alarm_panel == '' or states(alarm_panel) in ['disarmed', 'armed_home', 'armed_night'] }}
 
   # Compute whether brightness is low (lights should be on)
   brightness_is_low: >
