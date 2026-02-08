@@ -151,6 +151,59 @@ blueprint:
           unit_of_measurement: seconds
           mode: slider
 
+    adaptive_lighting_switch:
+      name: Adaptive Lighting Switch (optional)
+      description: >
+        The main enable/disable switch for Adaptive Lighting integration
+        (e.g., switch.adaptive_lighting_living_room).
+        Will be turned on and applied when lights turn on.
+      default: null
+      selector:
+        entity:
+          domain: switch
+
+    adaptive_lighting_sleep_mode_switch:
+      name: Adaptive Lighting Sleep Mode Switch (optional)
+      description: >
+        The sleep mode switch for Adaptive Lighting integration
+        (e.g., switch.adaptive_lighting_sleep_mode_living_room).
+        Will sync with the sleep_mode_entity state.
+      default: null
+      selector:
+        entity:
+          domain: switch
+
+    adaptive_lighting_apply_delay:
+      name: Adaptive Lighting Apply Delay (Seconds)
+      description: Delay before applying adaptive lighting after lights turn on. Prevents race conditions with slow-responding lights.
+      default: 0.5
+      selector:
+        number:
+          min: 0
+          max: 5
+          step: 0.1
+          unit_of_measurement: seconds
+          mode: slider
+
+    adaptive_lighting_transition:
+      name: Adaptive Lighting Transition Time (Seconds)
+      description: Transition time for applying adaptive lighting. 0 = instant change.
+      default: 0
+      selector:
+        number:
+          min: 0
+          max: 10
+          step: 0.5
+          unit_of_measurement: seconds
+          mode: slider
+
+    adaptive_lighting_prefer_rgb:
+      name: Adaptive Lighting Prefer RGB Color
+      description: Whether to prefer RGB color adjustment over color temperature when possible.
+      default: false
+      selector:
+        boolean:
+
 variables:
   auto_on_enabled: !input auto_on_enabled
   auto_off_enabled: !input auto_off_enabled
@@ -165,6 +218,14 @@ variables:
   has_manual_helper: "{{ manual_mode_helper != none and manual_mode_helper != '' }}"
   manual_off_delay: !input manual_off_delay
   auto_on_after_manual_off_delay: !input auto_on_after_manual_off_delay
+  adaptive_lighting_switch: !input adaptive_lighting_switch
+  adaptive_lighting_sleep_mode_switch: !input adaptive_lighting_sleep_mode_switch
+  adaptive_lighting_apply_delay: !input adaptive_lighting_apply_delay
+  adaptive_lighting_transition: !input adaptive_lighting_transition
+  adaptive_lighting_prefer_rgb: !input adaptive_lighting_prefer_rgb
+  has_adaptive_lighting: "{{ adaptive_lighting_switch != none and adaptive_lighting_switch != '' }}"
+  has_adaptive_lighting_sleep: "{{ adaptive_lighting_sleep_mode_switch != none and adaptive_lighting_sleep_mode_switch != '' }}"
+  lights_target: !input lights
 
   # Check if sleep mode is active
   sleep_mode_active: >
@@ -233,6 +294,13 @@ trigger:
     to: "on"
     id: sleep_mode_activated
 
+  # Trigger when sleep mode is deactivated
+  - platform: state
+    entity_id: !input sleep_mode_entity
+    from: "on"
+    to: "off"
+    id: sleep_mode_deactivated
+
 action:
   - choose:
       # Turn ON: auto-on enabled AND occupancy detected AND brightness is low AND NOT sleeping AND present
@@ -258,6 +326,22 @@ action:
                   entity_id: "{{ manual_mode_helper }}"
           - service: light.turn_on
             target: !input lights
+          - if:
+              - condition: template
+                value_template: "{{ has_adaptive_lighting }}"
+            then:
+              - service: switch.turn_on
+                target:
+                  entity_id: "{{ adaptive_lighting_switch }}"
+              - delay:
+                  seconds: "{{ adaptive_lighting_apply_delay }}"
+              - service: adaptive_lighting.apply
+                target:
+                  entity_id: "{{ adaptive_lighting_switch }}"
+                data:
+                  lights: "{{ lights_target.entity_id if lights_target.entity_id is defined else lights_target }}"
+                  transition: "{{ adaptive_lighting_transition }}"
+                  prefer_rgb_color: "{{ adaptive_lighting_prefer_rgb }}"
 
       # Turn OFF: auto-off enabled AND (no occupancy OR brightness is high)
       - conditions:
@@ -340,12 +424,35 @@ action:
                       entity_id: "{{ manual_mode_helper }}"
               - service: light.turn_on
                 target: !input lights
+              - if:
+                  - condition: template
+                    value_template: "{{ has_adaptive_lighting }}"
+                then:
+                  - service: switch.turn_on
+                    target:
+                      entity_id: "{{ adaptive_lighting_switch }}"
+                  - delay:
+                      seconds: "{{ adaptive_lighting_apply_delay }}"
+                  - service: adaptive_lighting.apply
+                    target:
+                      entity_id: "{{ adaptive_lighting_switch }}"
+                    data:
+                      lights: "{{ lights_target.entity_id if lights_target.entity_id is defined else lights_target }}"
+                      transition: "{{ adaptive_lighting_transition }}"
+                      prefer_rgb_color: "{{ adaptive_lighting_prefer_rgb }}"
 
-      # Handle sleep mode activation: turn off lights after delay
+      # Handle sleep mode activation: turn off lights after delay and sync adaptive lighting sleep mode
       - conditions:
           - condition: trigger
             id: sleep_mode_activated
         sequence:
+          - if:
+              - condition: template
+                value_template: "{{ has_adaptive_lighting_sleep }}"
+            then:
+              - service: switch.turn_on
+                target:
+                  entity_id: "{{ adaptive_lighting_sleep_mode_switch }}"
           - if:
               - condition: template
                 value_template: "{{ sleep_mode_off_delay | int > 0 }}"
@@ -361,6 +468,19 @@ action:
                   entity_id: "{{ manual_mode_helper }}"
           - service: light.turn_off
             target: !input lights
+
+      # Handle sleep mode deactivation: sync adaptive lighting sleep mode off
+      - conditions:
+          - condition: trigger
+            id: sleep_mode_deactivated
+        sequence:
+          - if:
+              - condition: template
+                value_template: "{{ has_adaptive_lighting_sleep }}"
+            then:
+              - service: switch.turn_off
+                target:
+                  entity_id: "{{ adaptive_lighting_sleep_mode_switch }}"
 
 mode: restart
 max_exceeded: silent
