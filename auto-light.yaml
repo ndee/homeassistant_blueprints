@@ -204,6 +204,65 @@ blueprint:
       selector:
         boolean:
 
+    wall_switch_events:
+      name: Wall Switch Event Entities (optional)
+      description: >
+        Event entities for wall switches that support press events
+        (e.g., event.hue_wall_switch_module_6_taste_1).
+        Triple-toggle detection will work with these.
+      default: []
+      selector:
+        entity:
+          domain: event
+          multiple: true
+
+    triple_toggle_time_window:
+      name: Triple Toggle Time Window (Seconds)
+      description: >
+        Time window in seconds for detecting triple toggle.
+        If the switch is toggled 3 times within this window, adaptive lighting is disabled
+        and lights turn on at full brightness with cold white.
+      default: 2
+      selector:
+        number:
+          min: 1
+          max: 5
+          step: 0.5
+          unit_of_measurement: seconds
+          mode: slider
+
+    triple_toggle_counter:
+      name: Triple Toggle Counter Helper (optional)
+      description: >
+        A counter helper to track toggle count for triple-toggle detection
+        (e.g., counter.wall_switch_toggle_count). Required if using wall switch events.
+      default: null
+      selector:
+        entity:
+          domain: counter
+
+    triple_toggle_timestamp:
+      name: Triple Toggle Timestamp Helper (optional)
+      description: >
+        An input_datetime helper to track last toggle timestamp
+        (e.g., input_datetime.wall_switch_last_toggle). Required if using wall switch events.
+      default: null
+      selector:
+        entity:
+          domain: input_datetime
+
+    full_brightness_color_temp:
+      name: Full Brightness Color Temperature (Kelvin)
+      description: Color temperature to use when triple-toggle activates full brightness mode.
+      default: 6500
+      selector:
+        number:
+          min: 2700
+          max: 6500
+          step: 100
+          unit_of_measurement: K
+          mode: slider
+
 variables:
   auto_on_enabled: !input auto_on_enabled
   auto_off_enabled: !input auto_off_enabled
@@ -226,6 +285,11 @@ variables:
   has_adaptive_lighting: "{{ adaptive_lighting_switch != none and adaptive_lighting_switch != '' }}"
   has_adaptive_lighting_sleep: "{{ adaptive_lighting_sleep_mode_switch != none and adaptive_lighting_sleep_mode_switch != '' }}"
   lights_target: !input lights
+  triple_toggle_counter: !input triple_toggle_counter
+  triple_toggle_timestamp: !input triple_toggle_timestamp
+  triple_toggle_time_window: !input triple_toggle_time_window
+  full_brightness_color_temp: !input full_brightness_color_temp
+  has_triple_toggle: "{{ triple_toggle_counter != none and triple_toggle_counter != '' and triple_toggle_timestamp != none and triple_toggle_timestamp != '' }}"
 
   # Check if sleep mode is active
   sleep_mode_active: >
@@ -300,6 +364,11 @@ trigger:
     from: "on"
     to: "off"
     id: sleep_mode_deactivated
+
+  # Trigger for wall switch events (for triple-toggle detection)
+  - platform: state
+    entity_id: !input wall_switch_events
+    id: wall_switch_event
 
 action:
   - choose:
@@ -481,6 +550,66 @@ action:
               - service: switch.turn_off
                 target:
                   entity_id: "{{ adaptive_lighting_sleep_mode_switch }}"
+
+      # Handle wall switch event: triple-toggle detection
+      - conditions:
+          - condition: trigger
+            id: wall_switch_event
+          - condition: template
+            value_template: "{{ has_triple_toggle }}"
+        sequence:
+          - variables:
+              current_time: "{{ now().timestamp() }}"
+              last_toggle_time: >
+                {% set ts = states(triple_toggle_timestamp) %}
+                {% if ts and ts not in ['unknown', 'unavailable'] %}
+                  {{ as_timestamp(ts, 0) }}
+                {% else %}
+                  0
+                {% endif %}
+              time_since_last: "{{ current_time - last_toggle_time }}"
+              current_count: "{{ states(triple_toggle_counter) | int(0) }}"
+          # Reset counter if time window expired
+          - if:
+              - condition: template
+                value_template: "{{ time_since_last > triple_toggle_time_window }}"
+            then:
+              - service: counter.reset
+                target:
+                  entity_id: "{{ triple_toggle_counter }}"
+          # Update timestamp
+          - service: input_datetime.set_datetime
+            target:
+              entity_id: "{{ triple_toggle_timestamp }}"
+            data:
+              datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+          # Increment counter
+          - service: counter.increment
+            target:
+              entity_id: "{{ triple_toggle_counter }}"
+          # Check if we reached 3 toggles
+          - if:
+              - condition: template
+                value_template: "{{ states(triple_toggle_counter) | int(0) >= 3 }}"
+            then:
+              # Reset counter
+              - service: counter.reset
+                target:
+                  entity_id: "{{ triple_toggle_counter }}"
+              # Disable adaptive lighting
+              - if:
+                  - condition: template
+                    value_template: "{{ has_adaptive_lighting }}"
+                then:
+                  - service: switch.turn_off
+                    target:
+                      entity_id: "{{ adaptive_lighting_switch }}"
+              # Turn on lights at full brightness cold white
+              - service: light.turn_on
+                target: !input lights
+                data:
+                  brightness: 255
+                  color_temp_kelvin: "{{ full_brightness_color_temp }}"
 
 mode: restart
 max_exceeded: silent
