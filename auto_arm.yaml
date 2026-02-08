@@ -1,0 +1,152 @@
+blueprint:
+  name: Auto Arm/Disarm Alarm (Alarmo)
+  description: >
+    Automatically arms the alarm when both persons are away for a configurable duration.
+    Automatically disarms when one person returns home for a configurable duration.
+    Designed for use with the Alarmo integration.
+  domain: automation
+  input:
+    person_1:
+      name: Person 1
+      description: First person to track for presence
+      selector:
+        entity:
+          domain: person
+
+    person_2:
+      name: Person 2
+      description: Second person to track for presence
+      selector:
+        entity:
+          domain: person
+
+    alarm_panel:
+      name: Alarm Control Panel
+      description: The Alarmo alarm control panel entity
+      selector:
+        entity:
+          domain: alarm_control_panel
+
+    away_delay:
+      name: Away Delay (Minutes)
+      description: Number of minutes both persons must be away before arming
+      default: 5
+      selector:
+        number:
+          min: 0
+          max: 60
+          step: 1
+          unit_of_measurement: minutes
+          mode: slider
+
+    home_delay:
+      name: Home Delay (Minutes)
+      description: Number of minutes a person must be home before disarming
+      default: 2
+      selector:
+        number:
+          min: 0
+          max: 30
+          step: 1
+          unit_of_measurement: minutes
+          mode: slider
+
+    alarm_code:
+      name: Alarm Code (optional)
+      description: Code to arm/disarm the alarm (leave empty if not required)
+      default: ""
+      selector:
+        text:
+          type: password
+
+variables:
+  person_1: !input person_1
+  person_2: !input person_2
+  alarm_panel: !input alarm_panel
+  alarm_code: !input alarm_code
+
+  # Check if both persons are away
+  both_away: >
+    {{ is_state(person_1, 'not_home') and is_state(person_2, 'not_home') }}
+
+  # Check if at least one person is home
+  someone_home: >
+    {{ is_state(person_1, 'home') or is_state(person_2, 'home') }}
+
+  # Check if alarm is currently disarmed
+  alarm_disarmed: >
+    {{ is_state(alarm_panel, 'disarmed') }}
+
+  # Check if alarm is currently armed or in arming/pending state
+  alarm_armed_or_arming: >
+    {{ states(alarm_panel) in ['armed_away', 'armed_home', 'armed_night', 'armed_vacation', 'arming', 'pending'] }}
+
+trigger:
+  # Person becomes away - use 'for' to wait the configured delay
+  - platform: state
+    entity_id: !input person_1
+    to: "not_home"
+    for:
+      minutes: !input away_delay
+    id: person_1_away
+
+  - platform: state
+    entity_id: !input person_2
+    to: "not_home"
+    for:
+      minutes: !input away_delay
+    id: person_2_away
+
+  # Person arrives home - use 'for' to wait the configured delay
+  - platform: state
+    entity_id: !input person_1
+    to: "home"
+    for:
+      minutes: !input home_delay
+    id: person_1_home
+
+  - platform: state
+    entity_id: !input person_2
+    to: "home"
+    for:
+      minutes: !input home_delay
+    id: person_2_home
+
+action:
+  - choose:
+      # ARM: Both persons have been away for the configured delay and alarm is disarmed
+      - conditions:
+          - condition: trigger
+            id:
+              - person_1_away
+              - person_2_away
+          - condition: template
+            value_template: "{{ both_away }}"
+          - condition: template
+            value_template: "{{ alarm_disarmed }}"
+        sequence:
+          - service: alarm_control_panel.alarm_arm_away
+            target:
+              entity_id: !input alarm_panel
+            data:
+              code: "{{ alarm_code if alarm_code != '' else none }}"
+
+      # DISARM: At least one person has been home for the configured delay and alarm is armed/arming
+      - conditions:
+          - condition: trigger
+            id:
+              - person_1_home
+              - person_2_home
+          - condition: template
+            value_template: "{{ someone_home }}"
+          - condition: template
+            value_template: "{{ alarm_armed_or_arming }}"
+        sequence:
+          - service: alarm_control_panel.alarm_disarm
+            target:
+              entity_id: !input alarm_panel
+            data:
+              code: "{{ alarm_code if alarm_code != '' else none }}"
+
+mode: parallel
+max_exceeded: silent
