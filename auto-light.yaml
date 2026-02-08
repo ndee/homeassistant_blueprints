@@ -76,8 +76,8 @@ blueprint:
           domain: alarm_control_panel
 
     lux_sensor:
-      name: Indoor Lux Sensor
-      description: Sensor measuring indoor illuminance in lux
+      name: Indoor Lux Sensor (optional)
+      description: Sensor measuring indoor illuminance in lux. If not configured, lights will turn on based on occupancy alone.
       default: null
       selector:
         entity:
@@ -264,60 +264,46 @@ variables:
   adaptive_lighting_apply_delay: !input adaptive_lighting_apply_delay
   adaptive_lighting_transition: !input adaptive_lighting_transition
   adaptive_lighting_prefer_rgb: !input adaptive_lighting_prefer_rgb
-  has_adaptive_lighting: "{{ adaptive_lighting_switch != none and adaptive_lighting_switch != '' }}"
-  has_adaptive_lighting_sleep: "{{ adaptive_lighting_sleep_mode_switch != none and adaptive_lighting_sleep_mode_switch != '' }}"
+  has_adaptive_lighting: "{{ adaptive_lighting_switch not in [none, '', 'null'] }}"
+  has_adaptive_lighting_sleep: "{{ adaptive_lighting_sleep_mode_switch not in [none, '', 'null'] }}"
   lights_target: !input lights
   state_helper: !input state_helper
   triple_toggle_time_window: !input triple_toggle_time_window
   full_brightness_color_temp: !input full_brightness_color_temp
-  has_state_helper: "{{ state_helper != none and state_helper != '' }}"
-
-  # Parse stored state from JSON helper
-  stored_state: >
-    {% if has_state_helper %}
-      {% set raw = states(state_helper) %}
-      {% if raw and raw not in ['unknown', 'unavailable', ''] %}
-        {{ raw | from_json }}
-      {% else %}
-        {{ {'manual_mode': false, 'toggle_count': 0, 'last_toggle': 0} }}
-      {% endif %}
-    {% else %}
-      {{ {'manual_mode': false, 'toggle_count': 0, 'last_toggle': 0} }}
-    {% endif %}
-
-  # Check if manual mode is active (from state helper)
-  manual_active: >
-    {{ has_state_helper and stored_state.get('manual_mode', false) }}
+  has_state_helper: "{{ state_helper not in [none, '', 'null'] }}"
+  has_lux_sensor: "{{ lux_sensor not in [none, '', 'null'] }}"
+  occupancy_sensor_entity: !input occupancy_sensor
 
   # Check if sleep mode is active
   sleep_mode_active: >
-    {{ sleep_mode_entity != none and sleep_mode_entity != '' and is_state(sleep_mode_entity, 'on') }}
+    {{ sleep_mode_entity not in [none, '', 'null'] and is_state(sleep_mode_entity, 'on') }}
 
   # Check if presence mode allows auto-on based on alarm panel state
   # Allow auto-on when: not configured, disarmed, armed_home, or armed_night (someone is home)
   # Prevent auto-on when: armed_away or armed_vacation (nobody home)
   presence_allows_on: >
-    {{ alarm_panel == none or alarm_panel == '' or states(alarm_panel) in ['disarmed', 'armed_home', 'armed_night'] }}
+    {{ alarm_panel in [none, '', 'null'] or states(alarm_panel) in ['disarmed', 'armed_home', 'armed_night'] }}
 
   # Compute whether brightness is low (lights should be on)
+  # If no lux sensor configured, assume brightness is low (allow auto-on)
   brightness_is_low: >
-    {% if lux_sensor != none and lux_sensor != '' %}
+    {% if has_lux_sensor %}
       {{ states(lux_sensor) | float(1000) < lux_on }}
     {% else %}
-      false
+      true
     {% endif %}
 
   # Compute whether brightness is high (lights can be turned off)
+  # If no lux sensor configured, brightness is never considered "high" (don't turn off due to brightness)
   brightness_is_high: >
-    {% if lux_sensor != none and lux_sensor != '' %}
+    {% if has_lux_sensor %}
       {{ states(lux_sensor) | float(0) > lux_off }}
     {% else %}
       false
     {% endif %}
 
-  off_delay_var: >
-    {{ manual_off_delay if manual_active else off_delay }}
-
+# Note: We use mode: queued to handle race conditions properly
+# This allows delays to complete without being cancelled by new triggers
 trigger:
   # Trigger when occupancy changes
   - platform: state
@@ -330,11 +316,6 @@ trigger:
     from: "on"
     to: "off"
     id: motion_cleared
-
-  # Trigger when lux sensor changes
-  - platform: state
-    entity_id: !input lux_sensor
-    id: lux_changed
 
   # Triggers for connected switches
   - platform: state
@@ -369,28 +350,48 @@ action:
   - choose:
       # Turn ON: auto-on enabled AND occupancy detected AND brightness is low AND NOT sleeping AND present
       - conditions:
+          - condition: trigger
+            id:
+              - motion_detected
           - condition: template
             value_template: "{{ auto_on_enabled }}"
           - condition: template
             value_template: "{{ not sleep_mode_active }}"
           - condition: template
             value_template: "{{ presence_allows_on }}"
-          - condition: state
-            entity_id: !input occupancy_sensor
-            state: "on"
           - condition: template
             value_template: "{{ brightness_is_low }}"
         sequence:
+          # Re-read state helper to get fresh values
+          - variables:
+              current_state: >
+                {% if has_state_helper %}
+                  {% set raw = states(state_helper) %}
+                  {% if raw and raw not in ['unknown', 'unavailable', ''] %}
+                    {{ raw | from_json }}
+                  {% else %}
+                    {{ {'manual_mode': false, 'brightness_boost': false, 'toggle_count': 0, 'last_toggle': 0} }}
+                  {% endif %}
+                {% else %}
+                  {{ {'manual_mode': false, 'brightness_boost': false, 'toggle_count': 0, 'last_toggle': 0} }}
+                {% endif %}
+          # Reset manual mode and brightness_boost if active (on auto turn-on)
           - if:
               - condition: template
-                value_template: "{{ has_state_helper and manual_active }}"
+                value_template: "{{ has_state_helper and (current_state.get('manual_mode', false) or current_state.get('brightness_boost', false)) }}"
             then:
               - service: input_text.set_value
                 target:
                   entity_id: "{{ state_helper }}"
                 data:
                   value: >
-                    {{ {'manual_mode': false, 'toggle_count': stored_state.get('toggle_count', 0), 'last_toggle': stored_state.get('last_toggle', 0)} | to_json }}
+                    {{ {'manual_mode': false, 'brightness_boost': false, 'toggle_count': current_state.get('toggle_count', 0), 'last_toggle': current_state.get('last_toggle', 0)} | to_json }}
+          # Only turn on if lights are not already on (avoid redundant calls)
+          - condition: template
+            value_template: >
+              {% set light_entities = lights_target.entity_id if lights_target.entity_id is defined else [lights_target] if lights_target is string else lights_target %}
+              {% set light_list = light_entities if light_entities is iterable and light_entities is not string else [light_entities] %}
+              {{ light_list | map('states') | select('eq', 'off') | list | length > 0 }}
           - service: light.turn_on
             target: !input lights
           - if:
@@ -410,34 +411,76 @@ action:
                   transition: "{{ adaptive_lighting_transition }}"
                   prefer_rgb_color: "{{ adaptive_lighting_prefer_rgb }}"
 
-      # Turn OFF: auto-off enabled AND (no occupancy OR brightness is high)
+      # Turn OFF: motion cleared AND auto-off enabled AND NOT in brightness boost mode
       - conditions:
+          - condition: trigger
+            id:
+              - motion_cleared
           - condition: template
             value_template: "{{ auto_off_enabled }}"
-          - condition: or
-            conditions:
+        sequence:
+          # Re-read state helper to get fresh values
+          - variables:
+              current_state: >
+                {% if has_state_helper %}
+                  {% set raw = states(state_helper) %}
+                  {% if raw and raw not in ['unknown', 'unavailable', ''] %}
+                    {{ raw | from_json }}
+                  {% else %}
+                    {{ {'manual_mode': false, 'brightness_boost': false, 'toggle_count': 0, 'last_toggle': 0} }}
+                  {% endif %}
+                {% else %}
+                  {{ {'manual_mode': false, 'brightness_boost': false, 'toggle_count': 0, 'last_toggle': 0} }}
+                {% endif %}
+              current_manual_active: "{{ has_state_helper and current_state.get('manual_mode', false) }}"
+              current_brightness_boost: "{{ has_state_helper and current_state.get('brightness_boost', false) }}"
+              current_off_delay: "{{ manual_off_delay if current_manual_active else off_delay }}"
+          # Skip auto-off if brightness boost is active (user must turn off manually)
+          - condition: template
+            value_template: "{{ not current_brightness_boost }}"
+          # Apply delay if configured
+          - if:
+              - condition: template
+                value_template: "{{ current_off_delay | int > 0 }}"
+            then:
+              - delay:
+                  seconds: "{{ current_off_delay | int }}"
+              # Re-check conditions after delay (critical fix for race condition)
               - condition: state
                 entity_id: !input occupancy_sensor
                 state: "off"
-              - condition: template
-                value_template: "{{ brightness_is_high }}"
-        sequence:
+          # Re-read state after delay and reset manual mode
+          - variables:
+              post_delay_state: >
+                {% if has_state_helper %}
+                  {% set raw = states(state_helper) %}
+                  {% if raw and raw not in ['unknown', 'unavailable', ''] %}
+                    {{ raw | from_json }}
+                  {% else %}
+                    {{ {'manual_mode': false, 'brightness_boost': false, 'toggle_count': 0, 'last_toggle': 0} }}
+                  {% endif %}
+                {% else %}
+                  {{ {'manual_mode': false, 'brightness_boost': false, 'toggle_count': 0, 'last_toggle': 0} }}
+                {% endif %}
+          # Check again if brightness boost was activated during delay - skip if so
+          - condition: template
+            value_template: "{{ not post_delay_state.get('brightness_boost', false) }}"
           - if:
               - condition: template
-                value_template: "{{ off_delay_var | int > 0 }}"
-            then:
-              - delay:
-                  seconds: "{{ off_delay_var | int }}"
-          - if:
-              - condition: template
-                value_template: "{{ has_state_helper and manual_active }}"
+                value_template: "{{ has_state_helper and post_delay_state.get('manual_mode', false) }}"
             then:
               - service: input_text.set_value
                 target:
                   entity_id: "{{ state_helper }}"
                 data:
                   value: >
-                    {{ {'manual_mode': false, 'toggle_count': stored_state.get('toggle_count', 0), 'last_toggle': stored_state.get('last_toggle', 0)} | to_json }}
+                    {{ {'manual_mode': false, 'brightness_boost': post_delay_state.get('brightness_boost', false), 'toggle_count': post_delay_state.get('toggle_count', 0), 'last_toggle': post_delay_state.get('last_toggle', 0)} | to_json }}
+          # Only turn off if lights are actually on
+          - condition: template
+            value_template: >
+              {% set light_entities = lights_target.entity_id if lights_target.entity_id is defined else [lights_target] if lights_target is string else lights_target %}
+              {% set light_list = light_entities if light_entities is iterable and light_entities is not string else [light_entities] %}
+              {{ light_list | map('states') | select('eq', 'on') | list | length > 0 }}
           - service: light.turn_off
             target: !input lights
 
@@ -450,34 +493,58 @@ action:
               - condition: template
                 value_template: "{{ has_state_helper }}"
             then:
+              # Re-read state to get current values
+              - variables:
+                  current_state: >
+                    {% set raw = states(state_helper) %}
+                    {% if raw and raw not in ['unknown', 'unavailable', ''] %}
+                      {{ raw | from_json }}
+                    {% else %}
+                      {{ {'manual_mode': false, 'brightness_boost': false, 'toggle_count': 0, 'last_toggle': 0} }}
+                    {% endif %}
               - service: input_text.set_value
                 target:
                   entity_id: "{{ state_helper }}"
                 data:
                   value: >
-                    {{ {'manual_mode': true, 'toggle_count': stored_state.get('toggle_count', 0), 'last_toggle': stored_state.get('last_toggle', 0)} | to_json }}
+                    {{ {'manual_mode': true, 'brightness_boost': current_state.get('brightness_boost', false), 'toggle_count': current_state.get('toggle_count', 0), 'last_toggle': current_state.get('last_toggle', 0)} | to_json }}
 
-      # Handle switch turned off: reset manual, delay, auto on if conditions
+      # Handle switch turned off: reset manual mode and brightness boost, delay, auto on if conditions
       - conditions:
           - condition: trigger
             id: switch_turned_off
         sequence:
+          # Re-read state
+          - variables:
+              current_state: >
+                {% if has_state_helper %}
+                  {% set raw = states(state_helper) %}
+                  {% if raw and raw not in ['unknown', 'unavailable', ''] %}
+                    {{ raw | from_json }}
+                  {% else %}
+                    {{ {'manual_mode': false, 'brightness_boost': false, 'toggle_count': 0, 'last_toggle': 0} }}
+                  {% endif %}
+                {% else %}
+                  {{ {'manual_mode': false, 'brightness_boost': false, 'toggle_count': 0, 'last_toggle': 0} }}
+                {% endif %}
+          # Reset both manual_mode and brightness_boost when switch turns off (manual action by user)
           - if:
               - condition: template
-                value_template: "{{ has_state_helper and manual_active }}"
+                value_template: "{{ has_state_helper and (current_state.get('manual_mode', false) or current_state.get('brightness_boost', false)) }}"
             then:
               - service: input_text.set_value
                 target:
                   entity_id: "{{ state_helper }}"
                 data:
                   value: >
-                    {{ {'manual_mode': false, 'toggle_count': stored_state.get('toggle_count', 0), 'last_toggle': stored_state.get('last_toggle', 0)} | to_json }}
+                    {{ {'manual_mode': false, 'brightness_boost': false, 'toggle_count': current_state.get('toggle_count', 0), 'last_toggle': current_state.get('last_toggle', 0)} | to_json }}
           - if:
               - condition: template
                 value_template: "{{ auto_on_after_manual_off_delay | int > 0 }}"
             then:
               - delay:
                   seconds: "{{ auto_on_after_manual_off_delay | int }}"
+          # Re-evaluate conditions after delay
           - if:
               - condition: template
                 value_template: "{{ auto_on_enabled }}"
@@ -489,7 +556,12 @@ action:
                 entity_id: !input occupancy_sensor
                 state: "on"
               - condition: template
-                value_template: "{{ brightness_is_low }}"
+                value_template: >
+                  {% if has_lux_sensor %}
+                    {{ states(lux_sensor) | float(1000) < lux_on }}
+                  {% else %}
+                    true
+                  {% endif %}
             then:
               - service: light.turn_on
                 target: !input lights
@@ -528,16 +600,29 @@ action:
             then:
               - delay:
                   seconds: "{{ sleep_mode_off_delay | int }}"
+          # Re-read and reset manual mode (but NOT brightness_boost - sleep mode should still turn off lights even in boost mode)
+          - variables:
+              current_state: >
+                {% if has_state_helper %}
+                  {% set raw = states(state_helper) %}
+                  {% if raw and raw not in ['unknown', 'unavailable', ''] %}
+                    {{ raw | from_json }}
+                  {% else %}
+                    {{ {'manual_mode': false, 'brightness_boost': false, 'toggle_count': 0, 'last_toggle': 0} }}
+                  {% endif %}
+                {% else %}
+                  {{ {'manual_mode': false, 'brightness_boost': false, 'toggle_count': 0, 'last_toggle': 0} }}
+                {% endif %}
           - if:
               - condition: template
-                value_template: "{{ has_state_helper and manual_active }}"
+                value_template: "{{ has_state_helper and (current_state.get('manual_mode', false) or current_state.get('brightness_boost', false)) }}"
             then:
               - service: input_text.set_value
                 target:
                   entity_id: "{{ state_helper }}"
                 data:
                   value: >
-                    {{ {'manual_mode': false, 'toggle_count': stored_state.get('toggle_count', 0), 'last_toggle': stored_state.get('last_toggle', 0)} | to_json }}
+                    {{ {'manual_mode': false, 'brightness_boost': false, 'toggle_count': current_state.get('toggle_count', 0), 'last_toggle': current_state.get('last_toggle', 0)} | to_json }}
           - service: light.turn_off
             target: !input lights
 
@@ -568,12 +653,13 @@ action:
                 {% if raw and raw not in ['unknown', 'unavailable', ''] %}
                   {{ raw | from_json }}
                 {% else %}
-                  {{ {'manual_mode': false, 'toggle_count': 0, 'last_toggle': 0} }}
+                  {{ {'manual_mode': false, 'brightness_boost': false, 'toggle_count': 0, 'last_toggle': 0} }}
                 {% endif %}
               last_toggle_time: "{{ current_stored.get('last_toggle', 0) | float(0) }}"
               time_since_last: "{{ current_time - last_toggle_time }}"
               old_count: "{{ current_stored.get('toggle_count', 0) | int(0) }}"
               current_manual: "{{ current_stored.get('manual_mode', false) }}"
+              current_boost: "{{ current_stored.get('brightness_boost', false) }}"
               # Reset count if time window expired, otherwise keep it
               base_count: "{{ 0 if time_since_last > triple_toggle_time_window else old_count }}"
               new_count: "{{ base_count + 1 }}"
@@ -582,18 +668,18 @@ action:
             target:
               entity_id: "{{ state_helper }}"
             data:
-              value: '{{ {"manual_mode": current_manual, "toggle_count": new_count, "last_toggle": current_time} | to_json }}'
+              value: '{{ {"manual_mode": current_manual, "brightness_boost": current_boost, "toggle_count": new_count, "last_toggle": current_time} | to_json }}'
           # Check if we reached 3 toggles
           - if:
               - condition: template
                 value_template: "{{ new_count >= 3 }}"
             then:
-              # Reset counter in state
+              # Reset counter and SET brightness_boost flag (prevents auto-off)
               - service: input_text.set_value
                 target:
                   entity_id: "{{ state_helper }}"
                 data:
-                  value: '{{ {"manual_mode": current_manual, "toggle_count": 0, "last_toggle": current_time} | to_json }}'
+                  value: '{{ {"manual_mode": current_manual, "brightness_boost": true, "toggle_count": 0, "last_toggle": current_time} | to_json }}'
               # Disable adaptive lighting
               - if:
                   - condition: template
@@ -609,5 +695,6 @@ action:
                   brightness: 255
                   color_temp_kelvin: "{{ full_brightness_color_temp }}"
 
-mode: restart
+mode: queued
+max: 5
 max_exceeded: silent
