@@ -1,24 +1,19 @@
 blueprint:
   name: Auto Arm/Disarm Alarm (Alarmo)
   description: >
-    Automatically arms the alarm when both persons are away for a configurable duration.
+    Automatically arms the alarm when all tracked persons are away for a configurable duration.
     Automatically disarms when one person returns home for a configurable duration.
     Designed for use with the Alarmo integration.
+    Robust handling of edge cases and state transitions.
   domain: automation
   input:
-    person_1:
-      name: Person 1
-      description: First person to track for presence
+    persons:
+      name: Persons to Track
+      description: Select all persons to track for presence. All must be away to arm, any one home to disarm.
       selector:
         entity:
           domain: person
-
-    person_2:
-      name: Person 2
-      description: Second person to track for presence
-      selector:
-        entity:
-          domain: person
+          multiple: true
 
     alarm_panel:
       name: Alarm Control Panel
@@ -60,18 +55,21 @@ blueprint:
           type: password
 
 variables:
-  person_1: !input person_1
-  person_2: !input person_2
+  persons: !input persons
   alarm_panel: !input alarm_panel
   alarm_code: !input alarm_code
+  away_delay_min: !input away_delay
+  home_delay_min: !input home_delay
 
-  # Check if both persons are away
-  both_away: >
-    {{ is_state(person_1, 'not_home') and is_state(person_2, 'not_home') }}
+  # Check if ALL persons are away (not_home)
+  all_away: >
+    {% set person_list = persons if persons is iterable and persons is not string else [persons] %}
+    {{ person_list | map('states') | select('eq', 'not_home') | list | length == person_list | length }}
 
   # Check if at least one person is home
   someone_home: >
-    {{ is_state(person_1, 'home') or is_state(person_2, 'home') }}
+    {% set person_list = persons if persons is iterable and persons is not string else [persons] %}
+    {{ person_list | map('states') | select('eq', 'home') | list | length > 0 }}
 
   # Check if alarm is currently disarmed
   alarm_disarmed: >
@@ -81,50 +79,55 @@ variables:
   alarm_armed_or_arming: >
     {{ states(alarm_panel) in ['armed_away', 'armed_home', 'armed_night', 'armed_vacation', 'arming', 'pending'] }}
 
+  # Check alarm availability
+  alarm_available: >
+    {{ states(alarm_panel) not in ['unknown', 'unavailable'] }}
+
+trigger_variables:
+  _away_delay: !input away_delay
+  _home_delay: !input home_delay
+
 trigger:
-  # Person becomes away - use 'for' to wait the configured delay
+  # Any person state changes - we'll filter in conditions
   - platform: state
-    entity_id: !input person_1
+    entity_id: !input persons
     to: "not_home"
     for:
-      minutes: !input away_delay
-    id: person_1_away
+      minutes: "{{ _away_delay | int }}"
+    id: person_away
 
   - platform: state
-    entity_id: !input person_2
-    to: "not_home"
-    for:
-      minutes: !input away_delay
-    id: person_2_away
-
-  # Person arrives home - use 'for' to wait the configured delay
-  - platform: state
-    entity_id: !input person_1
+    entity_id: !input persons
     to: "home"
     for:
-      minutes: !input home_delay
-    id: person_1_home
+      minutes: "{{ _home_delay | int }}"
+    id: person_home
 
+  # Also trigger when alarm state changes to handle edge cases
   - platform: state
-    entity_id: !input person_2
-    to: "home"
-    for:
-      minutes: !input home_delay
-    id: person_2_home
+    entity_id: !input alarm_panel
+    id: alarm_state_changed
+
+condition:
+  # Only proceed if alarm is available
+  - condition: template
+    value_template: "{{ alarm_available }}"
 
 action:
   - choose:
-      # ARM: Both persons have been away for the configured delay and alarm is disarmed
+      # ARM: All persons have been away for the configured delay and alarm is disarmed
       - conditions:
           - condition: trigger
             id:
-              - person_1_away
-              - person_2_away
+              - person_away
           - condition: template
-            value_template: "{{ both_away }}"
+            value_template: "{{ all_away }}"
           - condition: template
             value_template: "{{ alarm_disarmed }}"
         sequence:
+          # Double-check all persons are still away before arming
+          - condition: template
+            value_template: "{{ all_away }}"
           - service: alarm_control_panel.alarm_arm_away
             target:
               entity_id: !input alarm_panel
@@ -135,13 +138,34 @@ action:
       - conditions:
           - condition: trigger
             id:
-              - person_1_home
-              - person_2_home
+              - person_home
           - condition: template
             value_template: "{{ someone_home }}"
           - condition: template
             value_template: "{{ alarm_armed_or_arming }}"
         sequence:
+          # Double-check someone is still home before disarming
+          - condition: template
+            value_template: "{{ someone_home }}"
+          - service: alarm_control_panel.alarm_disarm
+            target:
+              entity_id: !input alarm_panel
+            data:
+              code: "{{ alarm_code if alarm_code != '' else none }}"
+
+      # RECOVERY: If alarm state changed externally and is out of sync, try to correct
+      # e.g., if someone is home but alarm is armed, disarm it
+      - conditions:
+          - condition: trigger
+            id: alarm_state_changed
+          - condition: template
+            value_template: "{{ someone_home and alarm_armed_or_arming }}"
+        sequence:
+          - delay:
+              seconds: 5
+          # Re-check conditions after brief delay
+          - condition: template
+            value_template: "{{ someone_home and alarm_armed_or_arming }}"
           - service: alarm_control_panel.alarm_disarm
             target:
               entity_id: !input alarm_panel
