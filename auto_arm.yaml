@@ -197,21 +197,20 @@ variables:
     {{ is_state(alarm_panel, 'triggered') }}
 
 trigger_variables:
-  _persons: !input persons
   _away_delay: !input away_delay
   _home_delay: !input home_delay
 
 trigger:
   # Any person state changes - we'll filter in conditions
   - platform: state
-    entity_id: "{{ _persons }}"
+    entity_id: !input persons
     to: "not_home"
     for:
       minutes: "{{ _away_delay | int }}"
     id: person_away
 
   - platform: state
-    entity_id: "{{ _persons }}"
+    entity_id: !input persons
     to: "home"
     for:
       minutes: "{{ _home_delay | int }}"
