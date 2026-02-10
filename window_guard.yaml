@@ -1,0 +1,218 @@
+blueprint:
+  name: Window Guard
+  description: >
+    Überwacht Fenster und sendet Benachrichtigungen, wenn ein Fenster zu lange offen ist
+    oder wenn Temperatur/Luftfeuchtigkeit unter konfigurierbare Schwellenwerte fallen.
+  domain: automation
+  input:
+    window_sensors:
+      name: Fenster Sensoren
+      description: Wähle einen oder mehrere Fenster-Sensoren aus
+      selector:
+        entity:
+          multiple: true
+          filter:
+            - domain: binary_sensor
+              device_class: window
+
+    time_threshold:
+      name: Zeitspanne
+      description: Wie lange darf das Fenster offen sein (in Minuten)
+      default: 30
+      selector:
+        number:
+          min: 1
+          max: 180
+          step: 1
+          unit_of_measurement: min
+          mode: slider
+
+    temperature_sensor:
+      name: Temperatur Sensor (Optional)
+      description: Optional - Temperatursensor zur Überwachung
+      default: {}
+      selector:
+        entity:
+          filter:
+            - domain: sensor
+              device_class: temperature
+
+    temperature_threshold:
+      name: Temperatur Schwellenwert (Optional)
+      description: Minimale Temperatur in °C (nur relevant wenn Sensor ausgewählt)
+      default: 18
+      selector:
+        number:
+          min: 0
+          max: 30
+          step: 0.5
+          unit_of_measurement: "°C"
+          mode: slider
+
+    humidity_sensor:
+      name: Luftfeuchte Sensor (Optional)
+      description: Optional - Luftfeuchtesensor zur Überwachung
+      default: {}
+      selector:
+        entity:
+          filter:
+            - domain: sensor
+              device_class: humidity
+
+    humidity_threshold:
+      name: Luftfeuchte Schwellenwert (Optional)
+      description: Minimale Luftfeuchtigkeit in % (nur relevant wenn Sensor ausgewählt)
+      default: 30
+      selector:
+        number:
+          min: 0
+          max: 100
+          step: 1
+          unit_of_measurement: "%"
+          mode: slider
+
+    notify_service:
+      name: Benachrichtigungs Service
+      description: Der zu verwendende Notify Service (z.B. notify.mobile_app_iphone)
+      selector:
+        text:
+
+mode: restart
+max_exceeded: silent
+
+trigger:
+  # Trigger wenn ein Fenster geöffnet wird
+  - platform: state
+    entity_id: !input window_sensors
+    to: "on"
+    id: window_opened
+
+  # Trigger für Temperaturänderungen (wenn Sensor vorhanden)
+  - platform: state
+    entity_id: !input temperature_sensor
+    id: temperature_changed
+
+  # Trigger für Luftfeuchtigkeitsänderungen (wenn Sensor vorhanden)
+  - platform: state
+    entity_id: !input humidity_sensor
+    id: humidity_changed
+
+variables:
+  window_sensors: !input window_sensors
+  time_threshold_minutes: !input time_threshold
+  temperature_sensor: !input temperature_sensor
+  temperature_threshold: !input temperature_threshold
+  humidity_sensor: !input humidity_sensor
+  humidity_threshold: !input humidity_threshold
+  notify_service: !input notify_service
+
+  # Ermittle alle offenen Fenster
+  open_windows: >
+    {% set ns = namespace(windows=[]) %}
+    {% for sensor in window_sensors %}
+      {% if is_state(sensor, 'on') %}
+        {% set ns.windows = ns.windows + [state_attr(sensor, 'friendly_name') | default(sensor)] %}
+      {% endif %}
+    {% endfor %}
+    {{ ns.windows }}
+
+  # Ermittle Fenster die zu lange offen sind
+  windows_open_too_long: >
+    {% set ns = namespace(windows=[]) %}
+    {% for sensor in window_sensors %}
+      {% if is_state(sensor, 'on') %}
+        {% set time_open = (now() - states[sensor].last_changed).total_seconds() / 60 %}
+        {% if time_open >= time_threshold_minutes %}
+          {% set ns.windows = ns.windows + [state_attr(sensor, 'friendly_name') | default(sensor)] %}
+        {% endif %}
+      {% endif %}
+    {% endfor %}
+    {{ ns.windows }}
+
+  current_temperature: >
+    {% if temperature_sensor %}
+      {{ states(temperature_sensor) | float(0) }}
+    {% else %}
+      {{ none }}
+    {% endif %}
+
+  current_humidity: >
+    {% if humidity_sensor %}
+      {{ states(humidity_sensor) | float(0) }}
+    {% else %}
+      {{ none }}
+    {% endif %}
+
+condition:
+  # Mindestens ein Fenster ist offen
+  - condition: template
+    value_template: "{{ open_windows | length > 0 }}"
+
+action:
+  - choose:
+      # Fall 1: Fenster wurde gerade geöffnet - warte auf Zeitschwelle
+      - conditions:
+          - condition: trigger
+            id: window_opened
+        sequence:
+          - delay:
+              minutes: !input time_threshold
+
+          # Prüfe ob Fenster immer noch offen ist
+          - condition: template
+            value_template: "{{ is_state(trigger.entity_id, 'on') }}"
+
+          - service: !input notify_service
+            data:
+              title: "⚠️ Fenster offen"
+              message: >
+                Das Fenster {{ state_attr(trigger.entity_id, 'friendly_name') | default(trigger.entity_id) }}
+                ist seit {{ time_threshold_minutes }} Minuten geöffnet.
+                {% if temperature_sensor %}
+                Temperatur: {{ states(temperature_sensor) }}°C
+                {% endif %}
+                {% if humidity_sensor %}
+                Luftfeuchtigkeit: {{ states(humidity_sensor) }}%
+                {% endif %}
+
+      # Fall 2: Temperatur fällt unter Schwellenwert
+      - conditions:
+          - condition: trigger
+            id: temperature_changed
+          - condition: template
+            value_template: "{{ temperature_sensor != none and temperature_sensor != {} }}"
+          - condition: template
+            value_template: "{{ current_temperature < temperature_threshold }}"
+        sequence:
+          - service: !input notify_service
+            data:
+              title: "🌡️ Temperatur zu niedrig"
+              message: >
+                Temperatur ist auf {{ current_temperature }}°C gefallen (Schwellenwert: {{ temperature_threshold }}°C).
+                {% if open_windows | length > 0 %}
+                Offene Fenster: {{ open_windows | join(', ') }}
+                {% endif %}
+                {% if humidity_sensor %}
+                Luftfeuchtigkeit: {{ states(humidity_sensor) }}%
+                {% endif %}
+
+      # Fall 3: Luftfeuchtigkeit fällt unter Schwellenwert
+      - conditions:
+          - condition: trigger
+            id: humidity_changed
+          - condition: template
+            value_template: "{{ humidity_sensor != none and humidity_sensor != {} }}"
+          - condition: template
+            value_template: "{{ current_humidity < humidity_threshold }}"
+        sequence:
+          - service: !input notify_service
+            data:
+              title: "💧 Luftfeuchtigkeit zu niedrig"
+              message: >
+                Luftfeuchtigkeit ist auf {{ current_humidity }}% gefallen (Schwellenwert: {{ humidity_threshold }}%).
+                {% if open_windows | length > 0 %}
+                Offene Fenster: {{ open_windows | join(', ') }}
+                {% endif %}
+                {% if temperature_sensor %}
+                Temperatur: {{ states(temperature_sensor) }}°C
+                {% endif %}
