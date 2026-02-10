@@ -22,9 +22,25 @@ blueprint:
         entity:
           domain: alarm_control_panel
 
+    arm_mode:
+      name: Arm Mode
+      description: Which mode to use when arming the alarm
+      default: arm_away
+      selector:
+        select:
+          options:
+            - label: Arm Away
+              value: arm_away
+            - label: Arm Home
+              value: arm_home
+            - label: Arm Night
+              value: arm_night
+            - label: Arm Vacation
+              value: arm_vacation
+
     away_delay:
       name: Away Delay (Minutes)
-      description: Number of minutes both persons must be away before arming
+      description: Number of minutes all persons must be away before arming
       default: 5
       selector:
         number:
@@ -54,22 +70,94 @@ blueprint:
         text:
           type: password
 
+    blocking_sensors:
+      name: Blocking Sensors (optional)
+      description: Sensors that must be off/closed before arming (e.g., doors, windows, motion sensors)
+      default: []
+      selector:
+        entity:
+          multiple: true
+
+    notification_device:
+      name: Notification Device (optional)
+      description: Mobile device to receive notifications when actions are taken
+      default: ""
+      selector:
+        device:
+          integration: mobile_app
+          multiple: false
+
+    enable_time_restriction:
+      name: Enable Time Restriction
+      description: Only auto-arm/disarm during specific times
+      default: false
+      selector:
+        boolean:
+
+    arm_after_time:
+      name: Earliest Arm Time
+      description: Don't auto-arm before this time (only if time restriction enabled)
+      default: "00:00:00"
+      selector:
+        time:
+
+    arm_before_time:
+      name: Latest Arm Time
+      description: Don't auto-arm after this time (only if time restriction enabled)
+      default: "23:59:59"
+      selector:
+        time:
+
+    retry_attempts:
+      name: Retry Attempts
+      description: Number of times to retry if arm/disarm fails
+      default: 3
+      selector:
+        number:
+          min: 0
+          max: 10
+          step: 1
+
+    retry_delay:
+      name: Retry Delay (seconds)
+      description: Seconds to wait between retry attempts
+      default: 5
+      selector:
+        number:
+          min: 1
+          max: 60
+          step: 1
+
 variables:
   persons: !input persons
   alarm_panel: !input alarm_panel
   alarm_code: !input alarm_code
-  away_delay_min: !input away_delay
-  home_delay_min: !input home_delay
+  arm_mode: !input arm_mode
+  blocking_sensors: !input blocking_sensors
+  notification_device: !input notification_device
+  enable_time_restriction: !input enable_time_restriction
+  arm_after_time: !input arm_after_time
+  arm_before_time: !input arm_before_time
+  retry_attempts: !input retry_attempts
+  retry_delay: !input retry_delay
 
-  # Check if ALL persons are away (not_home)
+  # Check if ALL persons are away (not_home) and NOT in unknown/unavailable states
   all_away: >
     {% set person_list = persons if persons is iterable and persons is not string else [persons] %}
-    {{ person_list | map('states') | select('eq', 'not_home') | list | length == person_list | length }}
+    {% set valid_persons = person_list | reject('match', '^(unknown|unavailable)$') | list %}
+    {{ valid_persons | length > 0 and
+       valid_persons | map('states') | select('eq', 'not_home') | list | length == valid_persons | length }}
 
-  # Check if at least one person is home
+  # Check if at least one person is home (and not in unknown/unavailable state)
   someone_home: >
     {% set person_list = persons if persons is iterable and persons is not string else [persons] %}
-    {{ person_list | map('states') | select('eq', 'home') | list | length > 0 }}
+    {% set valid_persons = person_list | reject('match', '^(unknown|unavailable)$') | list %}
+    {{ valid_persons | map('states') | select('eq', 'home') | list | length > 0 }}
+
+  # Check if all tracked persons are in valid states (not unknown/unavailable)
+  all_persons_valid: >
+    {% set person_list = persons if persons is iterable and persons is not string else [persons] %}
+    {{ person_list | map('states') | reject('match', '^(unknown|unavailable)$') | list | length == person_list | length }}
 
   # Check if alarm is currently disarmed
   alarm_disarmed: >
@@ -83,21 +171,47 @@ variables:
   alarm_available: >
     {{ states(alarm_panel) not in ['unknown', 'unavailable'] }}
 
+  # Check if any blocking sensors are active (prevent arming)
+  blocking_sensors_active: >
+    {% if blocking_sensors | length > 0 %}
+      {% set sensor_list = blocking_sensors if blocking_sensors is iterable and blocking_sensors is not string else [blocking_sensors] %}
+      {{ sensor_list | map('states') | select('in', ['on', 'open', 'detected', 'unlocked']) | list | length > 0 }}
+    {% else %}
+      false
+    {% endif %}
+
+  # Check if current time is within allowed arming window
+  within_time_window: >
+    {% if enable_time_restriction %}
+      {{ now().strftime('%H:%M:%S') >= arm_after_time and now().strftime('%H:%M:%S') <= arm_before_time }}
+    {% else %}
+      true
+    {% endif %}
+
+  # Map arm mode to service name
+  arm_service: >
+    alarm_control_panel.alarm_{{ arm_mode }}
+
+  # Check if alarm is in triggered state
+  alarm_triggered: >
+    {{ is_state(alarm_panel, 'triggered') }}
+
 trigger_variables:
+  _persons: !input persons
   _away_delay: !input away_delay
   _home_delay: !input home_delay
 
 trigger:
   # Any person state changes - we'll filter in conditions
   - platform: state
-    entity_id: !input persons
+    entity_id: "{{ _persons }}"
     to: "not_home"
     for:
       minutes: "{{ _away_delay | int }}"
     id: person_away
 
   - platform: state
-    entity_id: !input persons
+    entity_id: "{{ _persons }}"
     to: "home"
     for:
       minutes: "{{ _home_delay | int }}"
@@ -124,15 +238,71 @@ action:
             value_template: "{{ all_away }}"
           - condition: template
             value_template: "{{ alarm_disarmed }}"
+          - condition: template
+            value_template: "{{ all_persons_valid }}"
+          - condition: template
+            value_template: "{{ within_time_window }}"
+          - condition: template
+            value_template: "{{ not blocking_sensors_active }}"
+          - condition: template
+            value_template: "{{ not alarm_triggered }}"
         sequence:
           # Double-check all persons are still away before arming
           - condition: template
             value_template: "{{ all_away }}"
-          - service: alarm_control_panel.alarm_arm_away
-            target:
-              entity_id: !input alarm_panel
-            data:
-              code: "{{ alarm_code if alarm_code != '' else none }}"
+          - condition: template
+            value_template: "{{ not blocking_sensors_active }}"
+
+          # Attempt to arm with retry logic
+          - repeat:
+              count: "{{ retry_attempts | int }}"
+              sequence:
+                - service: "{{ arm_service }}"
+                  target:
+                    entity_id: !input alarm_panel
+                  data:
+                    code: "{{ alarm_code if alarm_code != '' else none }}"
+
+                # Wait to verify arming succeeded
+                - delay:
+                    seconds: 3
+
+                # Check if arming was successful
+                - choose:
+                    - conditions:
+                        - condition: template
+                          value_template: "{{ alarm_armed_or_arming }}"
+                      sequence:
+                        # Success - send notification and exit retry loop
+                        - if:
+                            - condition: template
+                              value_template: "{{ notification_device != '' }}"
+                          then:
+                            - device_id: !input notification_device
+                              domain: mobile_app
+                              type: notify
+                              title: "🔒 Alarm Armed"
+                              message: "Alarm automatically armed in {{ arm_mode.replace('arm_', '').replace('_', ' ').title() }} mode. All persons are away."
+                        - stop: "Arming successful"
+                  default:
+                    # Arming failed - wait before retry
+                    - if:
+                        - condition: template
+                          value_template: "{{ repeat.index < retry_attempts }}"
+                      then:
+                        - delay:
+                            seconds: "{{ retry_delay | int }}"
+
+          # If all retries failed, send error notification
+          - if:
+              - condition: template
+                value_template: "{{ not alarm_armed_or_arming and notification_device != '' }}"
+            then:
+              - device_id: !input notification_device
+                domain: mobile_app
+                type: notify
+                title: "⚠️ Alarm Arming Failed"
+                message: "Failed to arm alarm after {{ retry_attempts }} attempts. Please check manually."
 
       # DISARM: At least one person has been home for the configured delay and alarm is armed/arming
       - conditions:
@@ -143,15 +313,63 @@ action:
             value_template: "{{ someone_home }}"
           - condition: template
             value_template: "{{ alarm_armed_or_arming }}"
+          - condition: template
+            value_template: "{{ all_persons_valid }}"
         sequence:
           # Double-check someone is still home before disarming
           - condition: template
             value_template: "{{ someone_home }}"
-          - service: alarm_control_panel.alarm_disarm
-            target:
-              entity_id: !input alarm_panel
-            data:
-              code: "{{ alarm_code if alarm_code != '' else none }}"
+
+          # Attempt to disarm with retry logic
+          - repeat:
+              count: "{{ retry_attempts | int }}"
+              sequence:
+                - service: alarm_control_panel.alarm_disarm
+                  target:
+                    entity_id: !input alarm_panel
+                  data:
+                    code: "{{ alarm_code if alarm_code != '' else none }}"
+
+                # Wait to verify disarming succeeded
+                - delay:
+                    seconds: 3
+
+                # Check if disarming was successful
+                - choose:
+                    - conditions:
+                        - condition: template
+                          value_template: "{{ alarm_disarmed }}"
+                      sequence:
+                        # Success - send notification and exit retry loop
+                        - if:
+                            - condition: template
+                              value_template: "{{ notification_device != '' }}"
+                          then:
+                            - device_id: !input notification_device
+                              domain: mobile_app
+                              type: notify
+                              title: "🔓 Alarm Disarmed"
+                              message: "Alarm automatically disarmed. Someone is home."
+                        - stop: "Disarming successful"
+                  default:
+                    # Disarming failed - wait before retry
+                    - if:
+                        - condition: template
+                          value_template: "{{ repeat.index < retry_attempts }}"
+                      then:
+                        - delay:
+                            seconds: "{{ retry_delay | int }}"
+
+          # If all retries failed, send error notification
+          - if:
+              - condition: template
+                value_template: "{{ not alarm_disarmed and notification_device != '' }}"
+            then:
+              - device_id: !input notification_device
+                domain: mobile_app
+                type: notify
+                title: "⚠️ Alarm Disarming Failed"
+                message: "Failed to disarm alarm after {{ retry_attempts }} attempts. Please check manually."
 
       # RECOVERY: If alarm state changed externally and is out of sync, try to correct
       # e.g., if someone is home but alarm is armed, disarm it
@@ -160,17 +378,77 @@ action:
             id: alarm_state_changed
           - condition: template
             value_template: "{{ someone_home and alarm_armed_or_arming }}"
+          - condition: template
+            value_template: "{{ all_persons_valid }}"
         sequence:
           - delay:
               seconds: 5
           # Re-check conditions after brief delay
           - condition: template
             value_template: "{{ someone_home and alarm_armed_or_arming }}"
-          - service: alarm_control_panel.alarm_disarm
-            target:
-              entity_id: !input alarm_panel
-            data:
-              code: "{{ alarm_code if alarm_code != '' else none }}"
+
+          # Attempt to disarm
+          - repeat:
+              count: "{{ retry_attempts | int }}"
+              sequence:
+                - service: alarm_control_panel.alarm_disarm
+                  target:
+                    entity_id: !input alarm_panel
+                  data:
+                    code: "{{ alarm_code if alarm_code != '' else none }}"
+
+                - delay:
+                    seconds: 3
+
+                - choose:
+                    - conditions:
+                        - condition: template
+                          value_template: "{{ alarm_disarmed }}"
+                      sequence:
+                        - if:
+                            - condition: template
+                              value_template: "{{ notification_device != '' }}"
+                          then:
+                            - device_id: !input notification_device
+                              domain: mobile_app
+                              type: notify
+                              title: "🔓 Alarm Auto-Corrected"
+                              message: "Alarm was armed but someone is home. Automatically disarmed."
+                        - stop: "Recovery successful"
+                  default:
+                    - if:
+                        - condition: template
+                          value_template: "{{ repeat.index < retry_attempts }}"
+                      then:
+                        - delay:
+                            seconds: "{{ retry_delay | int }}"
+
+          # Send notification if recovery failed
+          - if:
+              - condition: template
+                value_template: "{{ not alarm_disarmed and notification_device != '' }}"
+            then:
+              - device_id: !input notification_device
+                domain: mobile_app
+                type: notify
+                title: "⚠️ Alarm Recovery Failed"
+                message: "Alarm is armed but someone is home. Auto-disarm failed. Please disarm manually."
+
+      # PREVENT ARMING: If blocking sensors are active, send notification
+      - conditions:
+          - condition: trigger
+            id:
+              - person_away
+          - condition: template
+            value_template: "{{ all_away and blocking_sensors_active }}"
+          - condition: template
+            value_template: "{{ notification_device != '' }}"
+        sequence:
+          - device_id: !input notification_device
+            domain: mobile_app
+            type: notify
+            title: "⚠️ Auto-Arm Blocked"
+            message: "Cannot arm alarm: blocking sensors are still active (doors/windows open, motion detected, etc.)"
 
 mode: parallel
 max_exceeded: silent
