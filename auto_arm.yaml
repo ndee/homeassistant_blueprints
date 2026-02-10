@@ -78,14 +78,14 @@ blueprint:
         entity:
           multiple: true
 
-    notify_service:
-      name: Notification Service (optional)
+    error_notification:
+      name: Notification on Error (optional)
       description: >
-        The notify service to use for notifications (e.g., notify.mobile_app_your_phone).
-        Leave empty to disable notifications. Find your service in Developer Tools > Services.
-      default: ""
+        Action to run when auto arm/disarm fails. Use any notify service (mobile app, Signal, etc.)
+        Leave empty to disable. Available variables: {{retry_attempts}}, {{arm_mode}}
+      default: []
       selector:
-        text:
+        action: {}
 
     enable_time_restriction:
       name: Enable Time Restriction
@@ -114,7 +114,7 @@ blueprint:
       default: 3
       selector:
         number:
-          min: 0
+          min: 1
           max: 10
           step: 1
 
@@ -134,16 +134,11 @@ variables:
   alarm_code: !input alarm_code
   arm_mode: !input arm_mode
   blocking_sensors: !input blocking_sensors
-  notify_service: !input notify_service
   enable_time_restriction: !input enable_time_restriction
   arm_after_time: !input arm_after_time
   arm_before_time: !input arm_before_time
   retry_attempts: !input retry_attempts
   retry_delay: !input retry_delay
-
-  # Check if notifications are enabled
-  notifications_enabled: >
-    {{ notify_service != '' and notify_service is string and notify_service | length > 0 }}
 
   # Check if ALL persons are away (not_home) and NOT in unknown/unavailable states
   all_away: >
@@ -275,15 +270,7 @@ action:
                     - condition: template
                       value_template: "{{ alarm_armed_or_arming }}"
                   then:
-                    # Success - send notification and exit retry loop
-                    - if:
-                        - condition: template
-                          value_template: "{{ notifications_enabled }}"
-                      then:
-                        - service: "{{ notify_service }}"
-                          data:
-                            title: "🔒 Alarm Armed"
-                            message: "Alarm automatically armed in {{ arm_mode.replace('arm_', '').replace('_', ' ').title() }} mode. All persons are away."
+                    # Success - exit retry loop (Alarmo handles success notifications)
                     - stop: "Arming successful"
                   else:
                     # Arming failed - wait before retry
@@ -294,15 +281,14 @@ action:
                         - delay:
                             seconds: "{{ retry_delay | int }}"
 
-          # If all retries failed, send error notification
+          # If all retries failed, run error notification
           - if:
               - condition: template
-                value_template: "{{ not alarm_armed_or_arming and notifications_enabled }}"
+                value_template: "{{ not alarm_armed_or_arming }}"
             then:
-              - service: "{{ notify_service }}"
-                data:
-                  title: "⚠️ Alarm Arming Failed"
-                  message: "Failed to arm alarm after {{ retry_attempts }} attempts. Please check manually."
+              - choose:
+                  - conditions: []
+                    sequence: !input error_notification
 
       # DISARM: At least one person has been home for the configured delay and alarm is armed/arming
       - conditions:
@@ -339,15 +325,7 @@ action:
                     - condition: template
                       value_template: "{{ alarm_disarmed }}"
                   then:
-                    # Success - send notification and exit retry loop
-                    - if:
-                        - condition: template
-                          value_template: "{{ notifications_enabled }}"
-                      then:
-                        - service: "{{ notify_service }}"
-                          data:
-                            title: "🔓 Alarm Disarmed"
-                            message: "Alarm automatically disarmed. Someone is home."
+                    # Success - exit retry loop (Alarmo handles success notifications)
                     - stop: "Disarming successful"
                   else:
                     # Disarming failed - wait before retry
@@ -358,15 +336,14 @@ action:
                         - delay:
                             seconds: "{{ retry_delay | int }}"
 
-          # If all retries failed, send error notification
+          # If all retries failed, run error notification
           - if:
               - condition: template
-                value_template: "{{ not alarm_disarmed and notifications_enabled }}"
+                value_template: "{{ not alarm_disarmed }}"
             then:
-              - service: "{{ notify_service }}"
-                data:
-                  title: "⚠️ Alarm Disarming Failed"
-                  message: "Failed to disarm alarm after {{ retry_attempts }} attempts. Please check manually."
+              - choose:
+                  - conditions: []
+                    sequence: !input error_notification
 
       # RECOVERY: If alarm state changed externally and is out of sync, try to correct
       # e.g., if someone is home but alarm is armed, disarm it
@@ -401,14 +378,7 @@ action:
                     - condition: template
                       value_template: "{{ alarm_disarmed }}"
                   then:
-                    - if:
-                        - condition: template
-                          value_template: "{{ notifications_enabled }}"
-                      then:
-                        - service: "{{ notify_service }}"
-                          data:
-                            title: "🔓 Alarm Auto-Corrected"
-                            message: "Alarm was armed but someone is home. Automatically disarmed."
+                    # Success - exit retry loop (Alarmo handles success notifications)
                     - stop: "Recovery successful"
                   else:
                     - if:
@@ -418,28 +388,14 @@ action:
                         - delay:
                             seconds: "{{ retry_delay | int }}"
 
-          # Send notification if recovery failed
+          # Run error notification if recovery failed
           - if:
               - condition: template
-                value_template: "{{ not alarm_disarmed and notifications_enabled }}"
+                value_template: "{{ not alarm_disarmed }}"
             then:
-              - service: "{{ notify_service }}"
-                data:
-                  title: "⚠️ Alarm Recovery Failed"
-                  message: "Alarm is armed but someone is home. Auto-disarm failed. Please disarm manually."
-
-      # PREVENT ARMING: If blocking sensors are active, send notification
-      - conditions:
-          - condition: trigger
-            id:
-              - person_away
-          - condition: template
-            value_template: "{{ all_away and blocking_sensors_active and notifications_enabled }}"
-        sequence:
-          - service: "{{ notify_service }}"
-            data:
-              title: "⚠️ Auto-Arm Blocked"
-              message: "Cannot arm alarm: blocking sensors are still active (doors/windows open, motion detected, etc.)"
+              - choose:
+                  - conditions: []
+                    sequence: !input error_notification
 
 mode: parallel
 max_exceeded: silent
