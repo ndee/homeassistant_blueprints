@@ -176,7 +176,7 @@ variables:
       {% set sensor_list = blocking_sensors if blocking_sensors is iterable and blocking_sensors is not string else [blocking_sensors] %}
       {{ sensor_list | map('states') | select('in', ['on', 'open', 'detected', 'unlocked']) | list | length > 0 }}
     {% else %}
-      false
+      {{ false }}
     {% endif %}
 
   # Check if current time is within allowed arming window
@@ -184,7 +184,7 @@ variables:
     {% if enable_time_restriction %}
       {{ now().strftime('%H:%M:%S') >= arm_after_time and now().strftime('%H:%M:%S') <= arm_before_time }}
     {% else %}
-      true
+      {{ true }}
     {% endif %}
 
   # Map arm mode to service name
