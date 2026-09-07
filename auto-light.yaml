@@ -46,11 +46,15 @@ blueprint:
 
     sleep_mode_entity:
       name: Sleep Mode (optional)
-      description: Input boolean for sleep mode - when ON, lights will only turn OFF automatically, never ON. When activated, lights turn off after the configured delay.
-      default: null
+      description: >
+        Optional input_boolean helper(s) for sleep mode. When any selected helper is ON,
+        lights will only turn OFF automatically, never ON. When activated, lights turn off
+        after the configured delay. Leave empty to disable sleep-mode handling.
+      default: []
       selector:
         entity:
           domain: input_boolean
+          multiple: true
 
     sleep_mode_off_delay:
       name: Sleep Mode Turn OFF Delay (Seconds)
@@ -166,7 +170,7 @@ blueprint:
       description: >
         The sleep mode switch for Adaptive Lighting integration
         (e.g., switch.adaptive_lighting_sleep_mode_living_room).
-        Will sync with the sleep_mode_entity state.
+        Will sync with the configured Sleep Mode helper state.
       default: null
       selector:
         entity:
@@ -257,7 +261,7 @@ blueprint:
 variables:
   auto_on_enabled: !input auto_on_enabled
   auto_off_enabled: !input auto_off_enabled
-  sleep_mode_entity: !input sleep_mode_entity
+  sleep_mode_entities: !input sleep_mode_entity
   sleep_mode_off_delay: !input sleep_mode_off_delay
   alarm_panel: !input alarm_panel
   lux_sensor: !input lux_sensor
@@ -283,7 +287,8 @@ variables:
 
   # Check if sleep mode is active
   sleep_mode_active: >
-    {{ sleep_mode_entity not in [none, '', 'null'] and is_state(sleep_mode_entity, 'on') }}
+    {{ sleep_mode_entities | count > 0
+       and (expand(sleep_mode_entities) | selectattr('state', 'eq', 'on') | list | count > 0) }}
 
   # Check if presence mode allows auto-on based on alarm panel state
   # Allow auto-on when: not configured, disarmed, armed_home, or armed_night (someone is home)
@@ -631,6 +636,9 @@ action:
           - condition: trigger
             id: sleep_mode_deactivated
         sequence:
+          # If multiple sleep helpers are selected, keep sleep mode active until all are off.
+          - condition: template
+            value_template: "{{ not sleep_mode_active }}"
           - if:
               - condition: template
                 value_template: "{{ has_adaptive_lighting_sleep }}"
