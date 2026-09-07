@@ -1,7 +1,7 @@
 blueprint:
-  name: Auto Light (Occupancy + Brightness) with Manual Switch Support
+  name: Auto Light (Occupancy + Optional Brightness) with Manual Switch Support
   description: >
-    Automatically turns lights on/off based on occupancy and indoor brightness.
+    Automatically turns lights on/off based on occupancy and, when configured, indoor brightness.
     Uses hysteresis (different on/off thresholds) to prevent flickering.
     Configurable off-delay prevents lights from turning off immediately when motion stops.
     Extended with support for connected switches: auto-on after delay when switch turns off lights, and different auto-off delay when turned on via switch.
@@ -32,14 +32,14 @@ blueprint:
 
     auto_on_enabled:
       name: Enable Auto ON
-      description: Automatically turn lights on when occupancy is detected and brightness is low
+      description: Automatically turn lights on when occupancy is detected and, if an Indoor Lux Sensor is configured, brightness is low
       default: true
       selector:
         boolean:
 
     auto_off_enabled:
       name: Enable Auto OFF
-      description: Automatically turn lights off when no occupancy or brightness is high
+      description: Automatically turn lights off when no occupancy or, if an Indoor Lux Sensor is configured, brightness is high
       default: true
       selector:
         boolean:
@@ -77,15 +77,20 @@ blueprint:
 
     lux_sensor:
       name: Indoor Lux Sensor (optional)
-      description: Sensor measuring indoor illuminance in lux. If not configured, lights will turn on based on occupancy alone.
-      default: null
+      description: >
+        Optional sensor measuring indoor illuminance in lux.
+        If not configured, all lux-based logic is ignored and the lux threshold settings below have no effect.
+        Auto-on then uses occupancy/presence conditions without a brightness check.
+      default: ""
       selector:
         entity:
           domain: sensor
 
     lux_threshold_on:
       name: Turn ON Below (lux)
-      description: Turn on lights when brightness is below this value
+      description: >
+        Turn on lights when brightness is below this value.
+        Requires an Indoor Lux Sensor; ignored when no Indoor Lux Sensor is configured.
       default: 50
       selector:
         number:
@@ -97,7 +102,9 @@ blueprint:
 
     lux_threshold_off:
       name: Turn OFF Above (lux)
-      description: Turn off lights when brightness exceeds this value (should be higher than ON threshold to prevent flickering)
+      description: >
+        Turn off lights when brightness exceeds this value (should be higher than ON threshold to prevent flickering).
+        Requires an Indoor Lux Sensor; ignored when no Indoor Lux Sensor is configured.
       default: 100
       selector:
         number:
@@ -284,8 +291,8 @@ variables:
   presence_allows_on: >
     {{ alarm_panel in [none, '', 'null'] or states(alarm_panel) in ['disarmed', 'armed_home', 'armed_night'] }}
 
-  # Compute whether brightness is low (lights should be on)
-  # If no lux sensor configured, assume brightness is low (allow auto-on)
+  # Lux checks are active only when an Indoor Lux Sensor is configured.
+  # With no sensor, lux-based logic is bypassed completely.
   brightness_is_low: >
     {% if has_lux_sensor %}
       {{ states(lux_sensor) | float(1000) < lux_on }}
@@ -293,8 +300,6 @@ variables:
       true
     {% endif %}
 
-  # Compute whether brightness is high (lights can be turned off)
-  # If no lux sensor configured, brightness is never considered "high" (don't turn off due to brightness)
   brightness_is_high: >
     {% if has_lux_sensor %}
       {{ states(lux_sensor) | float(0) > lux_off }}
@@ -556,12 +561,7 @@ action:
                 entity_id: !input occupancy_sensor
                 state: "on"
               - condition: template
-                value_template: >
-                  {% if has_lux_sensor %}
-                    {{ states(lux_sensor) | float(1000) < lux_on }}
-                  {% else %}
-                    true
-                  {% endif %}
+                value_template: "{{ brightness_is_low }}"
             then:
               - service: light.turn_on
                 target: !input lights
