@@ -1,10 +1,13 @@
 blueprint:
-  name: Auto Light (Occupancy + Optional Brightness) with Manual Switch Support
+  name: Auto Light (Occupancy + Optional Brightness) with Manual Switch Support v3
   description: >
     Automatically turns lights on/off based on occupancy and, when configured, indoor brightness.
     Uses hysteresis (different on/off thresholds) to prevent flickering.
     Configurable off-delay prevents lights from turning off immediately when motion stops.
     Extended with support for connected switches: auto-on after delay when switch turns off lights, and different auto-off delay when turned on via switch.
+    Robust Auto OFF tracks both occupancy and the actual controlled light entities, including when Lights is configured via an area, device, or label.
+    If an Indoor Lux Sensor is configured, high-lux Auto OFF is also active; with no sensor configured, all lux-related paths are ignored.
+    A lightweight 30-second safety reconciliation covers Home Assistant/automation reloads when OFF conditions were already true.
   domain: automation
   input:
     occupancy_sensor:
@@ -120,7 +123,7 @@ blueprint:
 
     off_delay:
       name: Turn OFF Delay (Auto)
-      description: Wait this many seconds after motion stops before turning off lights (0 = immediate) for auto on
+      description: Wait this many seconds while occupancy is OFF and a controlled light is ON before Auto OFF (0 = immediate)
       default: 0
       selector:
         number:
@@ -132,7 +135,7 @@ blueprint:
 
     manual_off_delay:
       name: Turn OFF Delay (Manual)
-      description: Wait this many seconds after motion stops before turning off lights when manually turned on via switch
+      description: Wait this many seconds while occupancy is OFF and a controlled light is ON when manual mode was activated via a connected switch
       default: 300
       selector:
         number:
@@ -258,6 +261,14 @@ blueprint:
           unit_of_measurement: K
           mode: slider
 
+
+trigger_variables:
+  occupancy_sensor_trigger: !input occupancy_sensor
+  lights_target_trigger: !input lights
+  state_helper_trigger: !input state_helper
+  lux_sensor_trigger: !input lux_sensor
+  lux_off_trigger: !input lux_threshold_off
+
 variables:
   auto_on_enabled: !input auto_on_enabled
   auto_off_enabled: !input auto_off_enabled
@@ -278,6 +289,84 @@ variables:
   has_adaptive_lighting: "{{ adaptive_lighting_switch not in [none, '', 'null'] }}"
   has_adaptive_lighting_sleep: "{{ adaptive_lighting_sleep_mode_switch not in [none, '', 'null'] }}"
   lights_target: !input lights
+
+  # Resolve the target selector to actual light entity IDs.
+  # This is important when "Lights" is configured with an area, device, or label
+  # instead of explicit light entities.
+  controlled_light_entities: >
+    {% set ns = namespace(entities=[]) %}
+    {% if lights_target is string %}
+      {% if lights_target.startswith('light.') %}
+        {% set ns.entities = ns.entities + [lights_target] %}
+      {% endif %}
+    {% elif lights_target is mapping %}
+      {% set direct_entities = lights_target.get('entity_id', []) %}
+      {% if direct_entities is string %}
+        {% set direct_entities = [direct_entities] %}
+      {% endif %}
+      {% for entity_id in direct_entities %}
+        {% if entity_id.startswith('light.') %}
+          {% set ns.entities = ns.entities + [entity_id] %}
+        {% endif %}
+      {% endfor %}
+
+      {% set device_ids = lights_target.get('device_id', []) %}
+      {% if device_ids is string %}
+        {% set device_ids = [device_ids] %}
+      {% endif %}
+      {% for device_id in device_ids %}
+        {% for entity_id in device_entities(device_id) %}
+          {% if entity_id.startswith('light.') %}
+            {% set ns.entities = ns.entities + [entity_id] %}
+          {% endif %}
+        {% endfor %}
+      {% endfor %}
+
+      {% set area_ids = lights_target.get('area_id', []) %}
+      {% if area_ids is string %}
+        {% set area_ids = [area_ids] %}
+      {% endif %}
+      {% for area_id in area_ids %}
+        {% for entity_id in area_entities(area_id) %}
+          {% if entity_id.startswith('light.') %}
+            {% set ns.entities = ns.entities + [entity_id] %}
+          {% endif %}
+        {% endfor %}
+      {% endfor %}
+
+      {% set label_ids = lights_target.get('label_id', []) %}
+      {% if label_ids is string %}
+        {% set label_ids = [label_ids] %}
+      {% endif %}
+      {% for label_id in label_ids %}
+        {# Entities directly carrying the label #}
+        {% for entity_id in label_entities(label_id) %}
+          {% if entity_id.startswith('light.') %}
+            {% set ns.entities = ns.entities + [entity_id] %}
+          {% endif %}
+        {% endfor %}
+
+        {# Devices carrying the label #}
+        {% for device_id in label_devices(label_id) %}
+          {% for entity_id in device_entities(device_id) %}
+            {% if entity_id.startswith('light.') %}
+              {% set ns.entities = ns.entities + [entity_id] %}
+            {% endif %}
+          {% endfor %}
+        {% endfor %}
+
+        {# Areas carrying the label #}
+        {% for area_id in label_areas(label_id) %}
+          {% for entity_id in area_entities(area_id) %}
+            {% if entity_id.startswith('light.') %}
+              {% set ns.entities = ns.entities + [entity_id] %}
+            {% endif %}
+          {% endfor %}
+        {% endfor %}
+      {% endfor %}
+    {% endif %}
+    {{ ns.entities | unique | list }}
+
   state_helper: !input state_helper
   triple_toggle_time_window: !input triple_toggle_time_window
   full_brightness_color_temp: !input full_brightness_color_temp
@@ -315,17 +404,178 @@ variables:
 # Note: We use mode: queued to handle race conditions properly
 # This allows delays to complete without being cancelled by new triggers
 trigger:
-  # Trigger when occupancy changes
+  # Trigger when occupancy is detected for Auto ON.
   - platform: state
     entity_id: !input occupancy_sensor
     from: "off"
     to: "on"
     id: motion_detected
-  - platform: state
-    entity_id: !input occupancy_sensor
-    from: "on"
-    to: "off"
-    id: motion_cleared
+
+  # Robust Auto OFF (automatic mode):
+  # Starts timing as soon as BOTH conditions are true:
+  #   1) occupancy is off
+  #   2) at least one controlled light is on
+  # This also works if the light is switched on while occupancy is already off.
+  - platform: template
+    id: auto_off_no_occupancy
+    value_template: >
+      {% set ns = namespace(entities=[]) %}
+      {% if lights_target_trigger is string %}
+        {% if lights_target_trigger.startswith('light.') %}
+          {% set ns.entities = ns.entities + [lights_target_trigger] %}
+        {% endif %}
+      {% elif lights_target_trigger is mapping %}
+        {% set direct_entities = lights_target_trigger.get('entity_id', []) %}
+        {% if direct_entities is string %}{% set direct_entities = [direct_entities] %}{% endif %}
+        {% for entity_id in direct_entities %}
+          {% if entity_id.startswith('light.') %}{% set ns.entities = ns.entities + [entity_id] %}{% endif %}
+        {% endfor %}
+
+        {% set device_ids = lights_target_trigger.get('device_id', []) %}
+        {% if device_ids is string %}{% set device_ids = [device_ids] %}{% endif %}
+        {% for device_id in device_ids %}
+          {% for entity_id in device_entities(device_id) %}
+            {% if entity_id.startswith('light.') %}{% set ns.entities = ns.entities + [entity_id] %}{% endif %}
+          {% endfor %}
+        {% endfor %}
+
+        {% set area_ids = lights_target_trigger.get('area_id', []) %}
+        {% if area_ids is string %}{% set area_ids = [area_ids] %}{% endif %}
+        {% for area_id in area_ids %}
+          {% for entity_id in area_entities(area_id) %}
+            {% if entity_id.startswith('light.') %}{% set ns.entities = ns.entities + [entity_id] %}{% endif %}
+          {% endfor %}
+        {% endfor %}
+
+        {% set label_ids = lights_target_trigger.get('label_id', []) %}
+        {% if label_ids is string %}{% set label_ids = [label_ids] %}{% endif %}
+        {% for label_id in label_ids %}
+          {% for entity_id in label_entities(label_id) %}
+            {% if entity_id.startswith('light.') %}{% set ns.entities = ns.entities + [entity_id] %}{% endif %}
+          {% endfor %}
+          {% for device_id in label_devices(label_id) %}
+            {% for entity_id in device_entities(device_id) %}
+              {% if entity_id.startswith('light.') %}{% set ns.entities = ns.entities + [entity_id] %}{% endif %}
+            {% endfor %}
+          {% endfor %}
+          {% for area_id in label_areas(label_id) %}
+            {% for entity_id in area_entities(area_id) %}
+              {% if entity_id.startswith('light.') %}{% set ns.entities = ns.entities + [entity_id] %}{% endif %}
+            {% endfor %}
+          {% endfor %}
+        {% endfor %}
+      {% endif %}
+
+      {% set helper = namespace(manual=false, boost=false) %}
+      {% if state_helper_trigger not in [none, '', 'null'] %}
+        {% set raw = states(state_helper_trigger) %}
+        {% if raw and raw not in ['unknown', 'unavailable', ''] %}
+          {% set stored = raw | from_json %}
+          {% set helper.manual = stored.get('manual_mode', false) %}
+          {% set helper.boost = stored.get('brightness_boost', false) %}
+        {% endif %}
+      {% endif %}
+
+      {{ is_state(occupancy_sensor_trigger, 'off')
+         and not helper.manual
+         and not helper.boost
+         and (expand(ns.entities | unique | list)
+              | selectattr('state', 'eq', 'on')
+              | list | count > 0) }}
+    for:
+      seconds: !input off_delay
+
+  # Robust Auto OFF (manual mode).
+  # Uses the separate manual delay when the connected switch has set manual_mode.
+  - platform: template
+    id: manual_off_no_occupancy
+    value_template: >
+      {% set ns = namespace(entities=[]) %}
+      {% if lights_target_trigger is string %}
+        {% if lights_target_trigger.startswith('light.') %}
+          {% set ns.entities = ns.entities + [lights_target_trigger] %}
+        {% endif %}
+      {% elif lights_target_trigger is mapping %}
+        {% set direct_entities = lights_target_trigger.get('entity_id', []) %}
+        {% if direct_entities is string %}{% set direct_entities = [direct_entities] %}{% endif %}
+        {% for entity_id in direct_entities %}
+          {% if entity_id.startswith('light.') %}{% set ns.entities = ns.entities + [entity_id] %}{% endif %}
+        {% endfor %}
+
+        {% set device_ids = lights_target_trigger.get('device_id', []) %}
+        {% if device_ids is string %}{% set device_ids = [device_ids] %}{% endif %}
+        {% for device_id in device_ids %}
+          {% for entity_id in device_entities(device_id) %}
+            {% if entity_id.startswith('light.') %}{% set ns.entities = ns.entities + [entity_id] %}{% endif %}
+          {% endfor %}
+        {% endfor %}
+
+        {% set area_ids = lights_target_trigger.get('area_id', []) %}
+        {% if area_ids is string %}{% set area_ids = [area_ids] %}{% endif %}
+        {% for area_id in area_ids %}
+          {% for entity_id in area_entities(area_id) %}
+            {% if entity_id.startswith('light.') %}{% set ns.entities = ns.entities + [entity_id] %}{% endif %}
+          {% endfor %}
+        {% endfor %}
+
+        {% set label_ids = lights_target_trigger.get('label_id', []) %}
+        {% if label_ids is string %}{% set label_ids = [label_ids] %}{% endif %}
+        {% for label_id in label_ids %}
+          {% for entity_id in label_entities(label_id) %}
+            {% if entity_id.startswith('light.') %}{% set ns.entities = ns.entities + [entity_id] %}{% endif %}
+          {% endfor %}
+          {% for device_id in label_devices(label_id) %}
+            {% for entity_id in device_entities(device_id) %}
+              {% if entity_id.startswith('light.') %}{% set ns.entities = ns.entities + [entity_id] %}{% endif %}
+            {% endfor %}
+          {% endfor %}
+          {% for area_id in label_areas(label_id) %}
+            {% for entity_id in area_entities(area_id) %}
+              {% if entity_id.startswith('light.') %}{% set ns.entities = ns.entities + [entity_id] %}{% endif %}
+            {% endfor %}
+          {% endfor %}
+        {% endfor %}
+      {% endif %}
+
+      {% set helper = namespace(manual=false, boost=false) %}
+      {% if state_helper_trigger not in [none, '', 'null'] %}
+        {% set raw = states(state_helper_trigger) %}
+        {% if raw and raw not in ['unknown', 'unavailable', ''] %}
+          {% set stored = raw | from_json %}
+          {% set helper.manual = stored.get('manual_mode', false) %}
+          {% set helper.boost = stored.get('brightness_boost', false) %}
+        {% endif %}
+      {% endif %}
+
+      {{ is_state(occupancy_sensor_trigger, 'off')
+         and helper.manual
+         and not helper.boost
+         and (expand(ns.entities | unique | list)
+              | selectattr('state', 'eq', 'on')
+              | list | count > 0) }}
+    for:
+      seconds: !input manual_off_delay
+
+  # Optional Lux Auto OFF:
+  # This trigger can only become true when an Indoor Lux Sensor is configured.
+  # With no lux sensor selected, the entire path remains false/ignored.
+  - platform: template
+    id: brightness_high
+    value_template: >
+      {{ lux_sensor_trigger not in [none, '', 'null']
+         and states(lux_sensor_trigger) not in ['unknown', 'unavailable', '']
+         and (states(lux_sensor_trigger) | float(0)) > (lux_off_trigger | float(0)) }}
+
+  # Safety reconciliation for states that were already true when automations were
+  # loaded/reloaded. Normal Auto OFF uses the exact template-trigger timers above;
+  # this fallback checks every 30 seconds and after Home Assistant starts.
+  - platform: time_pattern
+    seconds: "/30"
+    id: auto_off_safety_check
+
+  - platform: homeassistant
+    event: start
+    id: auto_off_safety_check
 
   # Triggers for connected switches
   - platform: state
@@ -396,12 +646,14 @@ action:
                 data:
                   value: >
                     {{ {'manual_mode': false, 'brightness_boost': false, 'toggle_count': current_state.get('toggle_count', 0), 'last_toggle': current_state.get('last_toggle', 0)} | to_json }}
-          # Only turn on if lights are not already on (avoid redundant calls)
+          # Only turn on if at least one resolved controlled light is off.
+          # If target resolution yields no entities, let Home Assistant resolve the target itself.
           - condition: template
             value_template: >
-              {% set light_entities = lights_target.entity_id if lights_target.entity_id is defined else [lights_target] if lights_target is string else lights_target %}
-              {% set light_list = light_entities if light_entities is iterable and light_entities is not string else [light_entities] %}
-              {{ light_list | map('states') | select('eq', 'off') | list | length > 0 }}
+              {{ controlled_light_entities | count == 0
+                 or (expand(controlled_light_entities)
+                     | selectattr('state', 'eq', 'off')
+                     | list | count > 0) }}
           - service: light.turn_on
             target: !input lights
           - if:
@@ -417,19 +669,133 @@ action:
                 target:
                   entity_id: "{{ adaptive_lighting_switch }}"
                 data:
-                  lights: "{{ lights_target.entity_id if lights_target.entity_id is defined else lights_target }}"
+                  lights: "{{ controlled_light_entities }}"
                   transition: "{{ adaptive_lighting_transition }}"
                   prefer_rgb_color: "{{ adaptive_lighting_prefer_rgb }}"
 
-      # Turn OFF: motion cleared AND auto-off enabled AND NOT in brightness boost mode
+      # Robust Turn OFF:
+      # The template triggers above have already verified that occupancy stayed off
+      # for the configured auto/manual delay while at least one controlled light was on.
       - conditions:
           - condition: trigger
             id:
-              - motion_cleared
+              - auto_off_no_occupancy
+              - manual_off_no_occupancy
+          - condition: template
+            value_template: "{{ auto_off_enabled }}"
+          - condition: state
+            entity_id: !input occupancy_sensor
+            state: "off"
+        sequence:
+          # Re-read the helper immediately before switching off so a newly activated
+          # brightness boost can still cancel the automatic OFF.
+          - variables:
+              current_state: >
+                {% if has_state_helper %}
+                  {% set raw = states(state_helper) %}
+                  {% if raw and raw not in ['unknown', 'unavailable', ''] %}
+                    {{ raw | from_json }}
+                  {% else %}
+                    {{ {'manual_mode': false, 'brightness_boost': false, 'toggle_count': 0, 'last_toggle': 0} }}
+                  {% endif %}
+                {% else %}
+                  {{ {'manual_mode': false, 'brightness_boost': false, 'toggle_count': 0, 'last_toggle': 0} }}
+                {% endif %}
+          - condition: template
+            value_template: "{{ not current_state.get('brightness_boost', false) }}"
+
+          # Only continue if a controlled light is still on.
+          - condition: template
+            value_template: >
+              {{ controlled_light_entities | count == 0
+                 or (expand(controlled_light_entities)
+                     | selectattr('state', 'eq', 'on')
+                     | list | count > 0) }}
+
+          # Reset manual mode after the manual auto-off has completed.
+          - if:
+              - condition: template
+                value_template: "{{ has_state_helper and current_state.get('manual_mode', false) }}"
+            then:
+              - service: input_text.set_value
+                target:
+                  entity_id: "{{ state_helper }}"
+                data:
+                  value: >
+                    {{ {
+                      'manual_mode': false,
+                      'brightness_boost': current_state.get('brightness_boost', false),
+                      'toggle_count': current_state.get('toggle_count', 0),
+                      'last_toggle': current_state.get('last_toggle', 0)
+                    } | to_json }}
+
+          - service: light.turn_off
+            target: !input lights
+
+      # Turn OFF when the optional Indoor Lux Sensor rises above the OFF threshold.
+      # This path is impossible when no lux sensor is configured.
+      - conditions:
+          - condition: trigger
+            id: brightness_high
           - condition: template
             value_template: "{{ auto_off_enabled }}"
         sequence:
-          # Re-read state helper to get fresh values
+          - variables:
+              current_state: >
+                {% if has_state_helper %}
+                  {% set raw = states(state_helper) %}
+                  {% if raw and raw not in ['unknown', 'unavailable', ''] %}
+                    {{ raw | from_json }}
+                  {% else %}
+                    {{ {'manual_mode': false, 'brightness_boost': false, 'toggle_count': 0, 'last_toggle': 0} }}
+                  {% endif %}
+                {% else %}
+                  {{ {'manual_mode': false, 'brightness_boost': false, 'toggle_count': 0, 'last_toggle': 0} }}
+                {% endif %}
+
+          # Brightness boost is an explicit manual override and blocks normal Auto OFF.
+          - condition: template
+            value_template: "{{ not current_state.get('brightness_boost', false) }}"
+
+          - condition: template
+            value_template: >
+              {{ controlled_light_entities | count == 0
+                 or (expand(controlled_light_entities)
+                     | selectattr('state', 'eq', 'on')
+                     | list | count > 0) }}
+
+          - if:
+              - condition: template
+                value_template: "{{ has_state_helper and current_state.get('manual_mode', false) }}"
+            then:
+              - service: input_text.set_value
+                target:
+                  entity_id: "{{ state_helper }}"
+                data:
+                  value: >
+                    {{ {
+                      'manual_mode': false,
+                      'brightness_boost': current_state.get('brightness_boost', false),
+                      'toggle_count': current_state.get('toggle_count', 0),
+                      'last_toggle': current_state.get('last_toggle', 0)
+                    } | to_json }}
+
+          - service: light.turn_off
+            target: !input lights
+
+      # Fallback Auto OFF reconciliation.
+      # Normal operation is handled by the exact template-trigger timers. This
+      # catches cases where the automation was loaded/reloaded while occupancy was
+      # already OFF and a light was already ON.
+      - conditions:
+          - condition: trigger
+            id: auto_off_safety_check
+          - condition: template
+            value_template: "{{ auto_off_enabled }}"
+          - condition: state
+            entity_id: !input occupancy_sensor
+            state: "off"
+        sequence:
           - variables:
               current_state: >
                 {% if has_state_helper %}
@@ -445,52 +811,65 @@ action:
               current_manual_active: "{{ has_state_helper and current_state.get('manual_mode', false) }}"
               current_brightness_boost: "{{ has_state_helper and current_state.get('brightness_boost', false) }}"
               current_off_delay: "{{ manual_off_delay if current_manual_active else off_delay }}"
-          # Skip auto-off if brightness boost is active (user must turn off manually)
+              occupancy_off_seconds: >
+                {% set occ = expand(occupancy_sensor_entity) | first %}
+                {% if occ is not none and occ.state == 'off' %}
+                  {{ (as_timestamp(now()) - as_timestamp(occ.last_changed)) | float(0) }}
+                {% else %}
+                  0
+                {% endif %}
+              newest_light_on_seconds: >
+                {% set on_lights = expand(controlled_light_entities)
+                   | selectattr('state', 'eq', 'on') | list %}
+                {% if on_lights | count == 0 %}
+                  0
+                {% else %}
+                  {% set ns = namespace(min_age=999999999) %}
+                  {% for light_state in on_lights %}
+                    {% set age = (as_timestamp(now()) - as_timestamp(light_state.last_changed)) | float(0) %}
+                    {% if age < ns.min_age %}
+                      {% set ns.min_age = age %}
+                    {% endif %}
+                  {% endfor %}
+                  {{ ns.min_age }}
+                {% endif %}
+
           - condition: template
             value_template: "{{ not current_brightness_boost }}"
-          # Apply delay if configured
-          - if:
-              - condition: template
-                value_template: "{{ current_off_delay | int > 0 }}"
-            then:
-              - delay:
-                  seconds: "{{ current_off_delay | int }}"
-              # Re-check conditions after delay (critical fix for race condition)
-              - condition: state
-                entity_id: !input occupancy_sensor
-                state: "off"
-          # Re-read state after delay and reset manual mode
-          - variables:
-              post_delay_state: >
-                {% if has_state_helper %}
-                  {% set raw = states(state_helper) %}
-                  {% if raw and raw not in ['unknown', 'unavailable', ''] %}
-                    {{ raw | from_json }}
-                  {% else %}
-                    {{ {'manual_mode': false, 'brightness_boost': false, 'toggle_count': 0, 'last_toggle': 0} }}
-                  {% endif %}
-                {% else %}
-                  {{ {'manual_mode': false, 'brightness_boost': false, 'toggle_count': 0, 'last_toggle': 0} }}
-                {% endif %}
-          # Check again if brightness boost was activated during delay - skip if so
+
+          # The resolver should always find entities for entity/device/area/label targets.
+          # Requiring at least one prevents the fallback from acting on an unresolved target.
           - condition: template
-            value_template: "{{ not post_delay_state.get('brightness_boost', false) }}"
+            value_template: >
+              {{ controlled_light_entities | count > 0
+                 and (expand(controlled_light_entities)
+                      | selectattr('state', 'eq', 'on')
+                      | list | count > 0) }}
+
+          # Both absence and the currently-on light(s) must have lasted for the configured delay.
+          # This prevents a newly manually switched-on light from being shut off immediately just
+          # because occupancy had already been OFF for a long time.
+          - condition: template
+            value_template: >
+              {{ (occupancy_off_seconds | float(0)) >= (current_off_delay | float(0))
+                 and (newest_light_on_seconds | float(0)) >= (current_off_delay | float(0)) }}
+
           - if:
               - condition: template
-                value_template: "{{ has_state_helper and post_delay_state.get('manual_mode', false) }}"
+                value_template: "{{ has_state_helper and current_state.get('manual_mode', false) }}"
             then:
               - service: input_text.set_value
                 target:
                   entity_id: "{{ state_helper }}"
                 data:
                   value: >
-                    {{ {'manual_mode': false, 'brightness_boost': post_delay_state.get('brightness_boost', false), 'toggle_count': post_delay_state.get('toggle_count', 0), 'last_toggle': post_delay_state.get('last_toggle', 0)} | to_json }}
-          # Only turn off if lights are actually on
-          - condition: template
-            value_template: >
-              {% set light_entities = lights_target.entity_id if lights_target.entity_id is defined else [lights_target] if lights_target is string else lights_target %}
-              {% set light_list = light_entities if light_entities is iterable and light_entities is not string else [light_entities] %}
-              {{ light_list | map('states') | select('eq', 'on') | list | length > 0 }}
+                    {{ {
+                      'manual_mode': false,
+                      'brightness_boost': current_state.get('brightness_boost', false),
+                      'toggle_count': current_state.get('toggle_count', 0),
+                      'last_toggle': current_state.get('last_toggle', 0)
+                    } | to_json }}
+
           - service: light.turn_off
             target: !input lights
 
@@ -583,7 +962,7 @@ action:
                     target:
                       entity_id: "{{ adaptive_lighting_switch }}"
                     data:
-                      lights: "{{ lights_target.entity_id if lights_target.entity_id is defined else lights_target }}"
+                      lights: "{{ controlled_light_entities }}"
                       transition: "{{ adaptive_lighting_transition }}"
                       prefer_rgb_color: "{{ adaptive_lighting_prefer_rgb }}"
 
