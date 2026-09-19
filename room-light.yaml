@@ -65,6 +65,23 @@ blueprint:
             target:
               entity:
                 - domain: light
+        watched_lights:
+          name: Lights to watch (same entities as above)
+          description: >
+            The SAME light entities as "Lights", listed again as a plain entity
+            list. This is unavoidable duplication: Home Assistant's state
+            triggers accept only entity IDs, never a target selector's dict, so
+            the target input above cannot be reused in the triggers that
+            implement the hard max-on-time cap and the external-change detection.
+            If this is left empty, those three triggers are inactive: the max
+            on-time cap will NOT fire and manual changes made outside HA will be
+            detected only via the switch event and Adaptive Lighting signals.
+          default: []
+          selector:
+            entity:
+              multiple: true
+              filter:
+                domain: light
         zone_state_helper:
           name: Zone state helper (input_text)
           description: >
@@ -292,6 +309,7 @@ mode: restart
 variables:
   occupancy_sensor: !input occupancy_sensor
   lights: !input lights
+  watched_lights: !input watched_lights
   zone_state_helper: !input zone_state_helper
   off_delay: !input off_delay
   night_off_delay: !input night_off_delay
@@ -327,11 +345,17 @@ variables:
        if lights is mapping else [] %}
     {{ [e] if e is string else (e | list) }}
 
-  zs_raw: "{{ states(zone_state_helper) }}"
+  # `| string` and the `d[:1]` slice are both deliberate. Inside an automation's
+  # variables: block, states() yields a template Wrapper object, not a str, and
+  # calling d.startswith('{') on it raises
+  #   UndefinedError: 'Wrapper object' has no attribute 'startswith'
+  # which aborts the whole run. That fails only AFTER the helper is first
+  # written, so it does not show up on an empty helper. Verified live.
+  zs_raw: "{{ states(zone_state_helper) | string }}"
   zs: >-
-    {% set d = zs_raw %}
+    {% set d = zs_raw | string %}
     {{ d | from_json
-       if d not in ['unknown','unavailable','',none] and d.startswith('{')
+       if d not in ['unknown','unavailable',''] and d[:1] == '{'
        else {'reason':'init','since':0,'manual_until':0,'act_at':0} }}
 
   manual_until: "{{ zs.get('manual_until', 0) | int(0) }}"
@@ -339,14 +363,15 @@ variables:
   # SIGNAL 2: Adaptive Lighting's own manual-control list.
   # Context-independent, so it still works if context behaves unexpectedly.
   # `manual_control` is absent (None) while the AL switch is off - hence default([]).
+  # ONE expression, not an {% if %} block: a block returns the STRING "false",
+  # which is truthy, and would make manual_active permanently true - blocking
+  # every auto-ON. See the same note on self_caused below.
   al_manual_hit: >-
     {% set sw = al_switch | default([], true) %}
-    {% if not use_al_manual_control or sw | count == 0 %}
-      false
-    {% else %}
-      {% set mc = state_attr(sw[0], 'manual_control') or [] %}
-      {{ light_entities | select('in', mc) | list | count > 0 }}
-    {% endif %}
+    {{ use_al_manual_control and sw | count > 0
+       and (light_entities
+            | select('in', state_attr(sw[0], 'manual_control') or [])
+            | list | count > 0) }}
 
   manual_active: >-
     {{ (manual_until > (as_timestamp(now()) | int)) or al_manual_hit }}
@@ -425,7 +450,7 @@ triggers:
   # mode: restart means only the last one to elapse completes its run - which is
   # harmless here, because the branch turns the whole group off anyway.
   - trigger: state
-    entity_id: !input lights
+    entity_id: !input watched_lights
     from: "off"
     to: "on"
     for:
@@ -446,12 +471,12 @@ triggers:
   # SIGNAL 3 - light changed by someone else. Transition-only (off->on / on->off),
   # so Adaptive Lighting's attribute-only `apply` can never trigger this.
   - trigger: state
-    entity_id: !input lights
+    entity_id: !input watched_lights
     from: "off"
     to: "on"
     id: light_on_external
   - trigger: state
-    entity_id: !input lights
+    entity_id: !input watched_lights
     from: "on"
     to: "off"
     id: light_off_external
@@ -496,21 +521,19 @@ actions:
       # taken BEFORE the run, so `this.context` is the PREVIOUS run's context.
       # HA passes the run context verbatim into service calls, so a state change
       # we caused carries context.id == our run's context.id.
+      # NOTE: written as ONE expression on purpose. A {% if %}/{% else %} block
+      # returns a STRING ("false"), and the non-empty string "false" is truthy,
+      # so `not self_caused` would always be False and manual detection via this
+      # signal would silently never fire. Verified live on HA 2026.5.4.
       self_caused: >-
-        {% if trg_ctx is none %}
-          false
-        {% elif trg_ctx.id == context.id %}
-          true
-        {% elif trg_ctx.parent_id is not none
-                and trg_ctx.parent_id == context.id %}
-          true
-        {% elif trg_ctx.user_id is none
-                and (now_ts - (zs.get('act_at',0) | int(0)))
-                    <= (self_action_grace | int) %}
-          true
-        {% else %}
-          false
-        {% endif %}
+        {{ trg_ctx is not none
+           and (
+             trg_ctx.id == context.id
+             or (trg_ctx.parent_id is not none and trg_ctx.parent_id == context.id)
+             or (trg_ctx.user_id is none
+                 and (now_ts - (zs.get('act_at', 0) | int(0)))
+                     <= (self_action_grace | int))
+           ) }}
       human_caused: >-
         {{ trigger.id in ['light_on_external','light_off_external']
            and not self_caused }}
