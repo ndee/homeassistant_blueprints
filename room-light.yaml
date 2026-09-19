@@ -108,6 +108,11 @@ blueprint:
             number: { min: 10, max: 3600, step: 10, unit_of_measurement: s, mode: box }
         night_off_delay:
           name: Off delay (night mode active)
+          description: >
+            Used INSTEAD of the day delay whenever any night mode helper is on.
+            Usually shorter: at night you want the light gone quickly once the
+            room is empty. Exactly one of the two delays applies per run, never
+            both.
           default: 60
           selector:
             number: { min: 10, max: 3600, step: 10, unit_of_measurement: s, mode: box }
@@ -123,6 +128,30 @@ blueprint:
             number: { min: 300, max: 21600, step: 60, unit_of_measurement: s, mode: box }
         manual_override_timeout:
           name: Manual override timeout
+          description: >
+            How long the automation stands down after a human touches the light.
+
+            When someone operates the light themselves - wall switch, Hue app,
+            HA dashboard, voice - this automation stops controlling that room
+            for this long. It will not auto-ON and it will not auto-OFF. The
+            countdown restarts on every further manual action, so as long as
+            someone keeps using the switch the automation keeps out of the way.
+
+            It expires on its own: once the time is up, normal occupancy
+            control resumes without anyone having to reset anything. Turning
+            the light manually OFF blocks auto-ON for the same period, unless
+            "Manual OFF also blocks auto-ON" is disabled.
+
+            The current state and the remaining seconds are visible in the zone
+            state helper as `manual_until`.
+
+            Two things are deliberately NOT suppressed: the hard maximum on-time
+            still turns the light off (that is the safety net against a light
+            left on all day), and arming the alarm still forces it off.
+
+            1800 s = 30 min suits normal rooms. Raise it for rooms where you sit
+            still for hours and the occupancy sensor is unreliable; lower it if
+            the automation feels slow to take back over after you flip a switch.
           default: 1800
           selector:
             number: { min: 60, max: 43200, step: 60, unit_of_measurement: s, mode: box }
