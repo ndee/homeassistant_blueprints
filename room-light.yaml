@@ -250,8 +250,31 @@ blueprint:
                 integration: adaptive_lighting
         use_al_manual_control:
           name: Treat AL manual_control as a manual override
+          description: >
+            Only switch this ON when Adaptive Lighting is configured on exactly
+            the same entities this zone controls. AL is often configured on a
+            Hue ROOM GROUP (light.kuche, light.bad, light.studio) while this
+            blueprint must target the individual lamps - because those groups
+            also contain plugs and fans. The names then never match, the signal
+            can never fire, and leaving this on would only look wired up.
+            Check the AL config entry's `lights` list before enabling.
           default: true
           selector: { boolean: {} }
+        night_peer_helpers:
+          name: Night mode helpers of zones sharing this AL sleep switch
+          description: >
+            Only needed when several zones share ONE Adaptive Lighting config,
+            and therefore one sleep_mode switch. List the OTHER zones' night
+            mode helpers here. AL sleep mode is then only released once none of
+            them is still in night mode, instead of the first zone to wake
+            cancelling night dimming for its neighbours.
+            Leave empty when this zone has its own AL config.
+          default: []
+          selector:
+            entity:
+              multiple: true
+              filter:
+                domain: input_boolean
 
     lux:
       name: Lux veto (optional)
@@ -354,6 +377,7 @@ variables:
   alarm_entity: !input alarm_entity
   al_switch: !input al_switch
   al_sleep_switch: !input al_sleep_switch
+  night_peer_helpers: !input night_peer_helpers
   use_al_manual_control: !input use_al_manual_control
   lux_sensor: !input lux_sensor
   lux_veto_above: !input lux_veto_above
@@ -752,6 +776,13 @@ actions:
       # ================================================================
       # 7. NIGHT MODE ENDS - release AL sleep mode
       # ================================================================
+      # Several zones may share one Adaptive Lighting config, and therefore one
+      # sleep switch (here: the three stairwell zones all use ..._flur). Their
+      # night mode helpers are INDEPENDENT, so without the guard below the first
+      # floor to wake would switch sleep mode off for the others while they are
+      # still asleep - last writer wins. `night_peer_helpers` lists the other
+      # zones' helpers so we only release AL when nobody sharing it is still in
+      # night mode.
       - alias: Night mode ended
         conditions:
           - condition: trigger
@@ -759,6 +790,10 @@ actions:
           - condition: template
             value_template: >-
               {{ al_sleep_switch | default([], true) | count > 0 }}
+          - condition: template
+            value_template: >-
+              {{ night_peer_helpers | default([], true)
+                 | select('is_state', 'on') | list | count == 0 }}
         sequence:
           - action: switch.turn_off
             target:
