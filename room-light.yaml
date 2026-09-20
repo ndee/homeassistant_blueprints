@@ -305,9 +305,64 @@ blueprint:
                 device_class: illuminance
         lux_veto_above:
           name: Veto auto-ON above (lux). 0 disables.
+          description: >
+            LEGACY, kept so existing instances do not change behaviour. Prefer
+            "Auto-ON below (lux)" below, which is a positive darkness signal
+            rather than a veto and comes with a staleness guard.
           default: 0
           selector:
             number: { min: 0, max: 2000, step: 5, unit_of_measurement: lx, mode: box }
+        lux_below:
+          name: Auto-ON below (lux). 0 disables.
+          description: >
+            A measured darkness signal: when the room reads below this, auto-ON
+            is allowed EVEN IF the sun is still up. This is what makes a room
+            with closed shutters, or a windowless one, behave correctly - the
+            sun says "bright" but the room is not.
+
+            Calibrate per room from its own readings; there is no useful global
+            value. Measured daytime medians here range from 2 lx (Eingang) to
+            489 lx (Gym), so one constant cannot serve both.
+
+            Only ever widens auto-ON, never blocks it: if the reading is too old
+            (see below) or the sensor is missing, the sun gate decides as before.
+          default: 0
+          selector:
+            number: { min: 0, max: 2000, step: 5, unit_of_measurement: lx, mode: box }
+        lux_max_age:
+          name: Ignore lux readings older than (s)
+          description: >
+            THE STALENESS GUARD, and the reason this is safe.
+
+            Hue lux sensors report on a FIXED ~5 minute schedule, NOT on motion
+            (measured: 87% of update gaps are exact multiples of 5 min). So at
+            the moment someone walks in, the reading is on average ~150 s old.
+
+            That is normally harmless, because auto-ON is only evaluated while
+            the lights are off, so any recent sample was taken in the dark. The
+            exception is re-entering a room within ~5 minutes of the lamp going
+            off: the newest sample may still date from when the lamp was lit,
+            read bright, and wrongly block the light. The blueprint therefore
+            also requires the reading to be NEWER than the moment the lights
+            last changed - the age limit here is the second line of defence.
+
+            300 s matches the reporting cadence. Lower it if your sensors report
+            faster (e.g. via Zigbee2MQTT, where the interval is configurable).
+          default: 300
+          selector:
+            number: { min: 30, max: 3600, step: 30, unit_of_measurement: s, mode: box }
+        always_dark:
+          name: Room is always dark (ignore daylight entirely)
+          description: >
+            For windowless rooms - a cellar, an inner hallway. Skips the sun and
+            lux gates completely, so occupancy alone decides. Presence, alarm and
+            night mode still apply.
+
+            Prefer this over setting the sun threshold to 90: it says what is
+            meant, and it survives someone later "correcting" the odd-looking
+            threshold.
+          default: false
+          selector: { boolean: {} }
 
     manual:
       name: Manual override
@@ -390,6 +445,9 @@ variables:
   use_al_manual_control: !input use_al_manual_control
   lux_sensor: !input lux_sensor
   lux_veto_above: !input lux_veto_above
+  lux_below: !input lux_below
+  lux_max_age: !input lux_max_age
+  always_dark: !input always_dark
   manual_off_sticks: !input manual_off_sticks
   ignore_context_entities: !input ignore_context_entities
   night_brightness_pct: !input night_brightness_pct
@@ -467,13 +525,59 @@ variables:
     {% set s = lux_sensor | default([], true) %}
     {{ states(s[0]) | float(-1) if s | count > 0 else -1 }}
 
+  # Age of the lux reading. 999999 when there is no sensor or it has no state,
+  # so every freshness test below fails closed onto the sun gate.
+  lux_age: >-
+    {% set s = lux_sensor | default([], true) %}
+    {{ 999999 if s | count == 0 or states[s[0]] is none
+       else (as_timestamp(now()) - as_timestamp(states[s[0]].last_changed)) | int(999999) }}
+
+  # Timestamp of the most recent state change among this zone's lights. A lux
+  # sample older than this may have been taken while the lamp was still lit and
+  # would read bright. 0 when nothing is known, which makes the test below pass.
+  lights_changed_ts: >-
+    {% set ns = namespace(m=0) %}
+    {% for e in light_entities %}
+      {% if states[e] is not none %}
+        {% set ns.m = [ns.m, as_timestamp(states[e].last_changed) | float(0)] | max %}
+      {% endif %}
+    {% endfor %}
+    {{ ns.m }}
+
+  # A lux reading is trustworthy when BOTH hold:
+  #   * it is younger than lux_max_age (the ~300 s reporting cadence), and
+  #   * it was taken AFTER the lights last changed, so it cannot be an echo of
+  #     our own lamp - this is the re-enter-within-5-minutes case.
+  lux_fresh: >-
+    {% set s = lux_sensor | default([], true) %}
+    {{ s | count > 0
+       and states[s[0]] is not none
+       and lux_now >= 0
+       and (lux_age | int(999999)) <= (lux_max_age | int(300))
+       and as_timestamp(states[s[0]].last_changed) | float(0)
+           >= (lights_changed_ts | float(0)) }}
+
   lux_vetoes_on: >-
     {{ (lux_veto_above | float(0)) > 0 and lux_now >= 0
        and lux_now > (lux_veto_above | float(0)) }}
 
+  # A measured, trustworthy reading below the threshold means the room IS dark,
+  # whatever the sun is doing. Only ever widens auto-ON.
+  lux_says_dark: >-
+    {{ (lux_below | float(0)) > 0
+       and lux_fresh
+       and lux_now < (lux_below | float(0)) }}
+
+  # THE DARKNESS GATE.
+  #   always_dark  - windowless room, daylight is irrelevant
+  #   lux_says_dark - measured and fresh: beats the sun (closed shutters etc.)
+  #   sun_is_dark   - the fallback whenever lux is absent, stale or untrusted
+  is_dark: >-
+    {{ always_dark or lux_says_dark or sun_is_dark }}
+
   may_auto_on: >-
     {{ auto_on_enabled and not manual_active and someone_home and alarm_ok
-       and sun_is_dark and not lux_vetoes_on
+       and is_dark and not lux_vetoes_on
        and not (block_auto_on_when_night and night_active) }}
 
   any_light_on: >-
