@@ -1,0 +1,823 @@
+## room-light.yaml — replaces ndee/auto-light.yaml
+##
+## Target path on the appliance:
+##   /config/blueprints/automation/ndee/room-light.yaml
+##
+## Verified against HA 2026.5.4 on 192.168.0.38.
+##
+## WHY THIS EXISTS
+## The previous blueprint put the off-delay in a `delay:` step under `mode: restart`.
+## The Hue lux sensors emit a state update every ~300 s even when the value is
+## unchanged, and the blueprint had a bare state trigger on the lux sensor. Every
+## lux tick restarted the run and cancelled the pending delay, so with off_delay
+## >= 300 s the light never turned off. Eight of eleven rooms were affected.
+##
+## The fix is structural, not a workaround: the off-delay now lives in a trigger
+## `for:`, which the trigger engine evaluates OUTSIDE the script run. `mode: restart`
+## stops script runs only and cannot cancel it. There is no `delay:` in the hot path
+## and no lux trigger at all.
+
+blueprint:
+  name: Room Light (occupancy, sun-gated, manual-wins)
+  description: >
+    Occupancy-driven room light controller. Replaces ndee/auto-light.yaml.
+
+      * Auto-ON gated by SUN ELEVATION, not lux. Lux is an optional veto only.
+      * Off-delays are `for:` on triggers, never `delay:`, so `mode: restart`
+        cannot cancel them.
+      * Manual changes lock the automation out for a configurable period.
+        Detection uses THREE independent signals: the physical switch `event.*`
+        entity, Adaptive Lighting's `manual_control` list, and HA context.
+      * Hard maximum on-time cap, independent of the occupancy sensor.
+      * Night dimming is delegated to Adaptive Lighting's sleep_mode switch.
+      * Per-floor night mode, presence and alarm gates.
+      * Every turn-off re-checks conditions immediately before acting.
+
+    LIMITATION: Hue wall switches are wired to bridge-side rules and actuate
+    lights WITHOUT involving Home Assistant. This blueprint cannot prevent a
+    switch from acting; it observes the result and stands down.
+  domain: automation
+  source_url: https://github.com/ndee/homeassistant_blueprints/blob/main/room-light.yaml
+
+  input:
+    core:
+      name: Core
+      icon: mdi:lightbulb-group
+      input:
+        occupancy_sensor:
+          name: Occupancy sensor
+          selector:
+            entity:
+              filter:
+                domain: binary_sensor
+        lights:
+          name: Lights
+          description: >
+            EXPLICIT light entities. Do NOT select an area: on this system several
+            areas contain smart plugs, a roller-shutter module and smoke detectors
+            modelled in the `light` domain (light.on_off_plug_1,
+            light.schalter_*, light.rauchmelder_*_basic,
+            light.rollladen_kuche_basic_1). Group entities also hide plugs:
+            light.studio contains a fan, light.wohnzimmer_licht contains a plug.
+            If an area or device is selected instead of entities, this blueprint
+            switches NOTHING rather than sweeping the area.
+          selector:
+            target:
+              entity:
+                - domain: light
+        watched_lights:
+          name: Lights to watch (same entities as above)
+          description: >
+            The SAME light entities as "Lights", listed again as a plain entity
+            list. This is unavoidable duplication: Home Assistant's state
+            triggers accept only entity IDs, never a target selector's dict, so
+            the target input above cannot be reused in the triggers that
+            implement the hard max-on-time cap and the external-change detection.
+            If this is left empty, those three triggers are inactive: the max
+            on-time cap will NOT fire and manual changes made outside HA will be
+            detected only via the switch event and Adaptive Lighting signals.
+          default: []
+          selector:
+            entity:
+              multiple: true
+              filter:
+                domain: light
+        zone_state_helper:
+          name: Zone state helper (input_text)
+          description: >
+            Per-zone input_text holding a small JSON blob. Required.
+            IMPORTANT: create it with max length 255. At the HA default of 100 the
+            payload is too long, and input_text.set_value then SILENTLY discards
+            the write (it logs a warning and keeps the old value).
+          selector:
+            entity:
+              filter:
+                domain: input_text
+
+    timing:
+      name: Timing
+      icon: mdi:timer-outline
+      input:
+        off_delay:
+          name: Off delay (day)
+          description: >
+            NOTE: the Bayesian occupancy sensors add their own decay lag
+            (measured 1-455 s) BEFORE this delay starts. Keep this short.
+          default: 120
+          selector:
+            number: { min: 10, max: 3600, step: 10, unit_of_measurement: s, mode: box }
+        night_off_delay:
+          name: Off delay (night mode active)
+          description: >
+            Used INSTEAD of the day delay whenever any night mode helper is on.
+            Usually shorter: at night you want the light gone quickly once the
+            room is empty. Exactly one of the two delays applies per run, never
+            both.
+          default: 60
+          selector:
+            number: { min: 10, max: 3600, step: 10, unit_of_measurement: s, mode: box }
+        max_on_time:
+          name: Hard maximum on-time
+          description: >
+            Absolute cap. Turns the light off after this long ON regardless of
+            occupancy. Catches cats, stuck sensors and Bayesian decay lag.
+            Cannot be disabled by setting 0 - use a large value instead, because
+            a trigger `for:` of 0 would fire immediately. Minimum 300 s.
+          default: 1800
+          selector:
+            number: { min: 300, max: 21600, step: 60, unit_of_measurement: s, mode: box }
+        manual_override_timeout:
+          name: Manual override timeout
+          description: >
+            How long the automation stands down after a human touches the light.
+
+            When someone operates the light themselves - wall switch, Hue app,
+            HA dashboard, voice - this automation stops controlling that room
+            for this long. It will not auto-ON and it will not auto-OFF. The
+            countdown restarts on every further manual action, so as long as
+            someone keeps using the switch the automation keeps out of the way.
+
+            It expires on its own: once the time is up, normal occupancy
+            control resumes without anyone having to reset anything. Turning
+            the light manually OFF blocks auto-ON for the same period, unless
+            "Manual OFF also blocks auto-ON" is disabled.
+
+            The current state and the remaining seconds are visible in the zone
+            state helper as `manual_until`.
+
+            Two things are deliberately NOT suppressed: the hard maximum on-time
+            still turns the light off (that is the safety net against a light
+            left on all day), and arming the alarm still forces it off.
+
+            1800 s = 30 min suits normal rooms. Raise it for rooms where you sit
+            still for hours and the occupancy sensor is unreliable; lower it if
+            the automation feels slow to take back over after you flip a switch.
+          default: 1800
+          selector:
+            number: { min: 60, max: 43200, step: 60, unit_of_measurement: s, mode: box }
+        self_action_grace:
+          name: Self-action grace window
+          description: >
+            A contextless light change within this many seconds of our own
+            action is attributed to us. Must exceed Adaptive Lighting's 0.5 s
+            apply delay by a wide margin.
+          default: 8
+          selector:
+            number: { min: 2, max: 60, step: 1, unit_of_measurement: s, mode: box }
+
+    gates:
+      name: Gates
+      icon: mdi:gate
+      input:
+        auto_on_enabled:
+          name: Enable auto-ON
+          default: true
+          selector: { boolean: {} }
+        auto_off_enabled:
+          name: Enable auto-OFF
+          default: true
+          selector: { boolean: {} }
+        sun_elevation_threshold:
+          name: Sun elevation threshold for auto-ON
+          description: >
+            Auto-ON only when the sun is BELOW this elevation. -6 = civil
+            twilight. Use a large positive value for windowless rooms.
+          default: -6.0
+          selector:
+            number: { min: -20.0, max: 20.0, step: 0.5, unit_of_measurement: "°", mode: slider }
+        night_mode_helper:
+          name: Night mode helper (per floor)
+          default: []
+          selector:
+            entity:
+              multiple: true
+              filter:
+                domain: input_boolean
+        block_auto_on_when_night:
+          name: Block auto-ON during night mode
+          description: Recommended ON - stops cats turning lights on at 3 AM.
+          default: true
+          selector: { boolean: {} }
+        presence_entities:
+          name: Presence entities
+          description: Auto-ON only if at least one is 'home'. Empty = no gate.
+          default: []
+          selector:
+            entity:
+              multiple: true
+              filter:
+                - domain: person
+                - domain: device_tracker
+        alarm_entity:
+          name: Alarm panel
+          default: []
+          selector:
+            entity:
+              multiple: true
+              filter:
+                domain: alarm_control_panel
+
+    adaptive:
+      name: Adaptive Lighting
+      icon: mdi:theme-light-dark
+      input:
+        al_switch:
+          name: Adaptive Lighting main switch
+          description: >
+            Used ONLY to read its `manual_control` attribute as an independent
+            manual-override signal. Never switched by this blueprint.
+            NOTE: when the AL switch is OFF, `manual_control` is absent (None),
+            which this blueprint treats as "no manual control".
+          default: []
+          selector:
+            entity:
+              multiple: true
+              filter:
+                domain: switch
+                integration: adaptive_lighting
+        al_sleep_switch:
+          name: Adaptive Lighting sleep_mode switch
+          description: >
+            Turned ON while the floor's night mode is active, so Adaptive
+            Lighting performs the night dimming. Leave empty for rooms with no
+            AL config (e.g. Eingang) and use Night brightness instead.
+          default: []
+          selector:
+            entity:
+              multiple: true
+              filter:
+                domain: switch
+                integration: adaptive_lighting
+        use_al_manual_control:
+          name: Treat AL manual_control as a manual override
+          description: >
+            Only switch this ON when Adaptive Lighting is configured on exactly
+            the same entities this zone controls. AL is often configured on a
+            Hue ROOM GROUP (light.kuche, light.bad, light.studio) while this
+            blueprint must target the individual lamps - because those groups
+            also contain plugs and fans. The names then never match, the signal
+            can never fire, and leaving this on would only look wired up.
+            Check the AL config entry's `lights` list before enabling.
+          default: true
+          selector: { boolean: {} }
+        night_peer_helpers:
+          name: Night mode helpers of zones sharing this AL sleep switch
+          description: >
+            Only needed when several zones share ONE Adaptive Lighting config,
+            and therefore one sleep_mode switch. List the OTHER zones' night
+            mode helpers here. AL sleep mode is then only released once none of
+            them is still in night mode, instead of the first zone to wake
+            cancelling night dimming for its neighbours.
+            Leave empty when this zone has its own AL config.
+          default: []
+          selector:
+            entity:
+              multiple: true
+              filter:
+                domain: input_boolean
+
+    lux:
+      name: Lux veto (optional)
+      icon: mdi:brightness-5
+      collapsed: true
+      input:
+        lux_sensor:
+          name: Lux sensor
+          description: >
+            OPTIONAL and NEVER a trigger. Vetoes auto-ON when already bright.
+            All Hue lux sensors here update on a ~300 s cadence and sit in the
+            room they illuminate, so readings are stale and self-illuminated.
+          default: []
+          selector:
+            entity:
+              multiple: true
+              filter:
+                domain: sensor
+                device_class: illuminance
+        lux_veto_above:
+          name: Veto auto-ON above (lux). 0 disables.
+          default: 0
+          selector:
+            number: { min: 0, max: 2000, step: 5, unit_of_measurement: lx, mode: box }
+
+    manual:
+      name: Manual override
+      icon: mdi:hand-back-right
+      collapsed: true
+      input:
+        manual_switch_events:
+          name: Physical switch event entities
+          description: >
+            The event.* entities of this zone's Hue wall switches / dimmers.
+            REQUIRED for reliable detection: Hue bridge rules actuate lights
+            without involving HA, so the switch event is the only certain
+            signal. Example: event.hue_wall_switch_module_8_taste_1
+            WARNING: module number does not equal room. Verify the friendly_name
+            before wiring one up (module_8_taste_1 is Toilette, but
+            module_8_taste_1_2 is Treppe 2.OG).
+          default: []
+          selector:
+            entity:
+              multiple: true
+              filter:
+                domain: event
+        manual_off_sticks:
+          name: Manual OFF also blocks auto-ON
+          default: true
+          selector: { boolean: {} }
+        ignore_context_entities:
+          name: Automations whose changes are NOT manual
+          description: >
+            Escape hatch. Add the apply_adaptive_lighting automations here only
+            if a trace shows them arming a false override.
+          default: []
+          selector:
+            entity:
+              multiple: true
+              filter:
+                domain: automation
+
+    appearance:
+      name: Appearance
+      icon: mdi:palette
+      collapsed: true
+      input:
+        night_brightness_pct:
+          name: Night brightness (%) - only when no AL sleep switch is set
+          description: >
+            Fallback night dimming for rooms without an Adaptive Lighting
+            config. 0 = send no attributes.
+          default: 0
+          selector:
+            number: { min: 0, max: 100, step: 1, unit_of_measurement: "%", mode: slider }
+        transition:
+          name: Transition (s)
+          default: 1
+          selector:
+            number: { min: 0, max: 10, step: 1, unit_of_measurement: s, mode: box }
+
+mode: restart
+
+variables:
+  occupancy_sensor: !input occupancy_sensor
+  lights: !input lights
+  watched_lights: !input watched_lights
+  zone_state_helper: !input zone_state_helper
+  off_delay: !input off_delay
+  night_off_delay: !input night_off_delay
+  max_on_time: !input max_on_time
+  manual_override_timeout: !input manual_override_timeout
+  self_action_grace: !input self_action_grace
+  auto_on_enabled: !input auto_on_enabled
+  auto_off_enabled: !input auto_off_enabled
+  sun_elevation_threshold: !input sun_elevation_threshold
+  night_mode_helper: !input night_mode_helper
+  block_auto_on_when_night: !input block_auto_on_when_night
+  presence_entities: !input presence_entities
+  alarm_entity: !input alarm_entity
+  al_switch: !input al_switch
+  al_sleep_switch: !input al_sleep_switch
+  night_peer_helpers: !input night_peer_helpers
+  use_al_manual_control: !input use_al_manual_control
+  lux_sensor: !input lux_sensor
+  lux_veto_above: !input lux_veto_above
+  manual_off_sticks: !input manual_off_sticks
+  ignore_context_entities: !input ignore_context_entities
+  night_brightness_pct: !input night_brightness_pct
+  transition: !input transition
+
+  # Explicit entities only. If an area/device was configured this is empty and
+  # nothing is switched - a fail-safe that makes the old area-sweep bug impossible.
+  #
+  # The string coercion is NOT cosmetic. A target selector stores a SINGLE chosen
+  # entity as a bare string, and Jinja's `| list` on a string splits it into
+  # characters: "light.toilette" would become ['l','i','g','h','t',...]. Verified
+  # live on this system.
+  light_entities: >-
+    {% set e = lights.entity_id | default([], true)
+       if lights is mapping else [] %}
+    {{ [e] if e is string else (e | list) }}
+
+  # `| string` and the `d[:1]` slice are both deliberate. Inside an automation's
+  # variables: block, states() yields a template Wrapper object, not a str, and
+  # calling d.startswith('{') on it raises
+  #   UndefinedError: 'Wrapper object' has no attribute 'startswith'
+  # which aborts the whole run. That fails only AFTER the helper is first
+  # written, so it does not show up on an empty helper. Verified live.
+  zs_raw: "{{ states(zone_state_helper) | string }}"
+  zs: >-
+    {% set d = zs_raw | string %}
+    {{ d | from_json
+       if d not in ['unknown','unavailable',''] and d[:1] == '{'
+       else {'reason':'init','since':0,'manual_until':0,'act_at':0} }}
+
+  manual_until: "{{ zs.get('manual_until', 0) | int(0) }}"
+
+  # SIGNAL 2: Adaptive Lighting's own manual-control list.
+  # Context-independent, so it still works if context behaves unexpectedly.
+  # `manual_control` is absent (None) while the AL switch is off - hence default([]).
+  # ONE expression, not an {% if %} block: a block returns the STRING "false",
+  # which is truthy, and would make manual_active permanently true - blocking
+  # every auto-ON. See the same note on self_caused below.
+  al_manual_hit: >-
+    {% set sw = al_switch | default([], true) %}
+    {{ use_al_manual_control and sw | count > 0
+       and (light_entities
+            | select('in', state_attr(sw[0], 'manual_control') or [])
+            | list | count > 0) }}
+
+  manual_active: >-
+    {{ (manual_until > (as_timestamp(now()) | int)) or al_manual_hit }}
+
+  night_active: >-
+    {{ night_mode_helper | default([], true)
+       | select('is_state', 'on') | list | count > 0 }}
+
+  someone_home: >-
+    {% set p = presence_entities | default([], true) %}
+    {{ true if p | count == 0
+       else p | select('is_state','home') | list | count > 0 }}
+
+  alarm_ok: >-
+    {% set a = alarm_entity | default([], true) %}
+    {{ true if a | count == 0
+       else a | reject('is_state','armed_away')
+              | reject('is_state','armed_home')
+              | reject('is_state','armed_night')
+              | reject('is_state','armed_vacation')
+              | reject('is_state','arming')
+              | reject('is_state','triggered')
+              | list | count == a | count }}
+
+  sun_is_dark: >-
+    {{ (state_attr('sun.sun','elevation') | float(-90))
+       < (sun_elevation_threshold | float(-6)) }}
+
+  # symmetric fallback: -1 = "no reading" -> never veto
+  lux_now: >-
+    {% set s = lux_sensor | default([], true) %}
+    {{ states(s[0]) | float(-1) if s | count > 0 else -1 }}
+
+  lux_vetoes_on: >-
+    {{ (lux_veto_above | float(0)) > 0 and lux_now >= 0
+       and lux_now > (lux_veto_above | float(0)) }}
+
+  may_auto_on: >-
+    {{ auto_on_enabled and not manual_active and someone_home and alarm_ok
+       and sun_is_dark and not lux_vetoes_on
+       and not (block_auto_on_when_night and night_active) }}
+
+  any_light_on: >-
+    {{ light_entities | select('is_state','on') | list | count > 0 }}
+
+triggers:
+  - trigger: state
+    entity_id: !input occupancy_sensor
+    from: "off"
+    to: "on"
+    id: occupied
+
+  # `for:` is evaluated by the trigger engine OUTSIDE the script run, so
+  # mode: restart cannot cancel it. THIS IS THE FIX for the 300s-lux-restart bug.
+  - trigger: state
+    entity_id: !input occupancy_sensor
+    from: "on"
+    to: "off"
+    for:
+      seconds: !input off_delay
+    id: clear_day
+
+  - trigger: state
+    entity_id: !input occupancy_sensor
+    from: "on"
+    to: "off"
+    for:
+      seconds: !input night_off_delay
+    id: clear_night
+
+  # Hard cap: `for:` on the lights themselves, independent of the occupancy
+  # sensor and therefore immune to Bayesian decay lag.
+  #
+  # NOTE: this watches the SAME target the actions command. When several lights
+  # are configured, each one that goes off->on starts its own `for:` timer, and
+  # mode: restart means only the last one to elapse completes its run - which is
+  # harmless here, because the branch turns the whole group off anyway.
+  - trigger: state
+    entity_id: !input watched_lights
+    from: "off"
+    to: "on"
+    for:
+      seconds: !input max_on_time
+    id: max_on_reached
+
+  # SIGNAL 1 - physical switch. The event.* state is an ISO timestamp that
+  # changes on every press, so the state trigger sees a real value change.
+  # (`to: 'on'` - as the old blueprint used - can never match an event entity.)
+  # `not_to` also implies HA's "old != new" guard, which is what we want.
+  - trigger: state
+    entity_id: !input manual_switch_events
+    not_to:
+      - unknown
+      - unavailable
+    id: manual_switch
+
+  # SIGNAL 3 - light changed by someone else. Transition-only (off->on / on->off),
+  # so Adaptive Lighting's attribute-only `apply` can never trigger this.
+  - trigger: state
+    entity_id: !input watched_lights
+    from: "off"
+    to: "on"
+    id: light_on_external
+  - trigger: state
+    entity_id: !input watched_lights
+    from: "on"
+    to: "off"
+    id: light_off_external
+
+  - trigger: state
+    entity_id: !input occupancy_sensor
+    to: "on"
+    id: reeval
+
+  - trigger: state
+    entity_id: !input night_mode_helper
+    from: "off"
+    to: "on"
+    id: night_started
+  - trigger: state
+    entity_id: !input night_mode_helper
+    from: "on"
+    to: "off"
+    id: night_ended
+  - trigger: state
+    entity_id: !input alarm_entity
+    to:
+      - armed_away
+      - armed_home
+      - armed_night
+      - armed_vacation
+    id: alarm_armed
+
+conditions: []
+
+actions:
+  - variables:
+      now_ts: "{{ as_timestamp(now()) | int }}"
+      trg_ctx: >-
+        {{ trigger.to_state.context
+           if (trigger.to_state is defined and trigger.to_state is not none)
+           else none }}
+      # Did WE cause this light change?
+      #
+      # `context` (the script-run context) is the correct reference, NOT
+      # `this.context`: `this` is a snapshot of the automation entity's state
+      # taken BEFORE the run, so `this.context` is the PREVIOUS run's context.
+      # HA passes the run context verbatim into service calls, so a state change
+      # we caused carries context.id == our run's context.id.
+      # NOTE: written as ONE expression on purpose. A {% if %}/{% else %} block
+      # returns a STRING ("false"), and the non-empty string "false" is truthy,
+      # so `not self_caused` would always be False and manual detection via this
+      # signal would silently never fire. Verified live on HA 2026.5.4.
+      self_caused: >-
+        {{ trg_ctx is not none
+           and (
+             trg_ctx.id == context.id
+             or (trg_ctx.parent_id is not none and trg_ctx.parent_id == context.id)
+             or (trg_ctx.user_id is none
+                 and (now_ts - (zs.get('act_at', 0) | int(0)))
+                     <= (self_action_grace | int))
+           ) }}
+      human_caused: >-
+        {{ trigger.id in ['light_on_external','light_off_external']
+           and not self_caused }}
+
+  - choose:
+
+      # ================================================================
+      # 1. MANUAL - physical switch pressed (Hue bridge already acted)
+      # ================================================================
+      - alias: Manual switch pressed
+        conditions:
+          - condition: trigger
+            id: manual_switch
+        sequence:
+          # The bridge actuates the light ~1 s after the press. Wait so we
+          # record the RESULTING state. Not timing-critical: if a restart
+          # cancels this, the light_*_external branch still arms the override.
+          - delay:
+              milliseconds: 1500
+          - variables:
+              now2: "{{ as_timestamp(now()) | int }}"
+              on_after: >-
+                {{ light_entities | select('is_state','on') | list | count > 0 }}
+          - action: input_text.set_value
+            target:
+              entity_id: !input zone_state_helper
+            data:
+              value: >-
+                {{ {'reason': 'manual_switch_' ~ ('on' if on_after else 'off'),
+                    'since': now2,
+                    'manual_until': (now2 + (manual_override_timeout | int))
+                                    if (on_after or manual_off_sticks) else 0,
+                    'act_at': zs.get('act_at', 0) | int(0) } | to_json }}
+
+      # ================================================================
+      # 2. MANUAL - light changed via any other human path
+      # ================================================================
+      - alias: Light changed externally
+        conditions:
+          - condition: template
+            value_template: "{{ human_caused }}"
+        sequence:
+          - variables:
+              turned_on: "{{ trigger.id == 'light_on_external' }}"
+              src: >-
+                {{ 'ui' if trg_ctx.user_id is not none else 'bridge' }}
+          - action: input_text.set_value
+            target:
+              entity_id: !input zone_state_helper
+            data:
+              value: >-
+                {{ {'reason': 'manual_' ~ ('on' if turned_on else 'off') ~ '_' ~ src,
+                    'since': now_ts,
+                    'manual_until': (now_ts + (manual_override_timeout | int))
+                                    if (turned_on or manual_off_sticks) else 0,
+                    'act_at': zs.get('act_at', 0) | int(0) } | to_json }}
+
+      # ================================================================
+      # 3. HARD MAX-ON CAP - beats occupancy AND beats manual override
+      # ================================================================
+      - alias: Max on-time reached
+        conditions:
+          - condition: trigger
+            id: max_on_reached
+        sequence:
+          - action: light.turn_off
+            target:
+              entity_id: "{{ light_entities }}"
+            data:
+              transition: "{{ transition | int }}"
+          - action: input_text.set_value
+            target:
+              entity_id: !input zone_state_helper
+            data:
+              value: >-
+                {{ {'reason': 'max_on_time_cap', 'since': now_ts,
+                    'manual_until': 0, 'act_at': now_ts } | to_json }}
+
+      # ================================================================
+      # 4. AUTO-ON
+      # ================================================================
+      - alias: Auto ON
+        conditions:
+          - condition: trigger
+            id: [occupied, reeval]
+          - condition: template
+            value_template: "{{ may_auto_on }}"
+          - condition: state
+            entity_id: !input occupancy_sensor
+            state: "on"
+          - condition: template
+            value_template: "{{ not any_light_on }}"
+          - condition: template
+            value_template: "{{ light_entities | count > 0 }}"
+        sequence:
+          - action: light.turn_on
+            target:
+              entity_id: "{{ light_entities }}"
+            # No brightness/colour unless this room has NO AL sleep switch and
+            # a night brightness was configured. Sending attributes would mark
+            # the light manually-controlled in AL and stop it adapting.
+            data: >-
+              {{ {'transition': transition | int}
+                 | combine({'brightness_pct': night_brightness_pct | int}
+                    if (night_active
+                        and (al_sleep_switch | default([], true) | count == 0)
+                        and (night_brightness_pct | int) > 0)
+                    else {}) }}
+          - action: input_text.set_value
+            target:
+              entity_id: !input zone_state_helper
+            data:
+              value: >-
+                {{ {'reason': 'auto_on_occupancy' ~ ('_night' if night_active else ''),
+                    'since': now_ts, 'manual_until': 0,
+                    'act_at': now_ts } | to_json }}
+
+      # ================================================================
+      # 5. AUTO-OFF  (post-delay re-check)
+      # ================================================================
+      - alias: Auto OFF
+        conditions:
+          - condition: trigger
+            id: [clear_day, clear_night]
+          - condition: template
+            value_template: "{{ auto_off_enabled }}"
+          # Only the delay matching the current mode may act.
+          - condition: template
+            value_template: >-
+              {{ (trigger.id == 'clear_night') == (night_active | bool) }}
+          # RE-CHECK immediately before acting: still unoccupied?
+          - condition: state
+            entity_id: !input occupancy_sensor
+            state: "off"
+          - condition: template
+            value_template: "{{ not manual_active }}"
+          - condition: template
+            value_template: "{{ any_light_on }}"
+        sequence:
+          - action: light.turn_off
+            target:
+              entity_id: "{{ light_entities }}"
+            data:
+              transition: "{{ transition | int }}"
+          - action: input_text.set_value
+            target:
+              entity_id: !input zone_state_helper
+            data:
+              value: >-
+                {{ {'reason': 'auto_off_' ~ ('night' if night_active else 'day'),
+                    'since': now_ts, 'manual_until': 0,
+                    'act_at': now_ts } | to_json }}
+
+      # ================================================================
+      # 6. NIGHT MODE STARTS - hand dimming to Adaptive Lighting, lights off
+      # ================================================================
+      - alias: Night mode started
+        conditions:
+          - condition: trigger
+            id: night_started
+        sequence:
+          - if:
+              - condition: template
+                value_template: >-
+                  {{ al_sleep_switch | default([], true) | count > 0 }}
+            then:
+              - action: switch.turn_on
+                target:
+                  entity_id: !input al_sleep_switch
+          - if:
+              - condition: template
+                value_template: "{{ any_light_on }}"
+            then:
+              - action: light.turn_off
+                target:
+                  entity_id: "{{ light_entities }}"
+                data:
+                  transition: "{{ transition | int }}"
+              - action: input_text.set_value
+                target:
+                  entity_id: !input zone_state_helper
+                data:
+                  value: >-
+                    {{ {'reason': 'forced_off_night_started', 'since': now_ts,
+                        'manual_until': 0, 'act_at': now_ts } | to_json }}
+
+      # ================================================================
+      # 7. NIGHT MODE ENDS - release AL sleep mode
+      # ================================================================
+      # Several zones may share one Adaptive Lighting config, and therefore one
+      # sleep switch (here: the three stairwell zones all use ..._flur). Their
+      # night mode helpers are INDEPENDENT, so without the guard below the first
+      # floor to wake would switch sleep mode off for the others while they are
+      # still asleep - last writer wins. `night_peer_helpers` lists the other
+      # zones' helpers so we only release AL when nobody sharing it is still in
+      # night mode.
+      - alias: Night mode ended
+        conditions:
+          - condition: trigger
+            id: night_ended
+          - condition: template
+            value_template: >-
+              {{ al_sleep_switch | default([], true) | count > 0 }}
+          - condition: template
+            value_template: >-
+              {{ night_peer_helpers | default([], true)
+                 | select('is_state', 'on') | list | count == 0 }}
+        sequence:
+          - action: switch.turn_off
+            target:
+              entity_id: !input al_sleep_switch
+
+      # ================================================================
+      # 8. ALARM ARMED - lights off, clear override
+      # ================================================================
+      - alias: Alarm armed forces off
+        conditions:
+          - condition: trigger
+            id: alarm_armed
+          - condition: template
+            value_template: "{{ any_light_on }}"
+        sequence:
+          - action: light.turn_off
+            target:
+              entity_id: "{{ light_entities }}"
+            data:
+              transition: "{{ transition | int }}"
+          - action: input_text.set_value
+            target:
+              entity_id: !input zone_state_helper
+            data:
+              value: >-
+                {{ {'reason': 'forced_off_alarm_armed', 'since': now_ts,
+                    'manual_until': 0, 'act_at': now_ts } | to_json }}
