@@ -735,11 +735,31 @@ actions:
       # returns a STRING ("false"), and the non-empty string "false" is truthy,
       # so `not self_caused` would always be False and manual detection via this
       # signal would silently never fire. Verified live on HA 2026.5.4.
+      # The THIRD test is the one that matters under `mode: restart`.
+      #
+      # When a branch of this automation switches the light, that change fires
+      # light_on_external / light_off_external, which RESTARTS the automation.
+      # The new run is a CHILD of the light change, so the lineage is inverted
+      # relative to the first two tests:
+      #
+      #   light change ctx : {id: X, parent_id: <the run that switched it>}
+      #   this run's ctx   : {id: Y, parent_id: X}      <-- parent is the change
+      #
+      # Only `context.parent_id == trg_ctx.id` catches that. Without it the
+      # automation reads its own max_on_time / auto_off / auto_on action as a
+      # human one and arms a 30 minute manual override against itself.
+      # Observed live on 2026-09-21: max_on_time_cap at 06:04:39 was immediately
+      # overwritten by manual_off_ui, blocking auto-ON until 08:34.
+      #
+      # The grace-window test below cannot cover this: `mode: restart` cancels
+      # the acting run before it writes `act_at`, so the re-entrant run reads
+      # the PREVIOUS value. It stays only as a last resort for bridge actions.
       self_caused: >-
         {{ trg_ctx is not none
            and (
              trg_ctx.id == context.id
              or (trg_ctx.parent_id is not none and trg_ctx.parent_id == context.id)
+             or (context.parent_id is not none and context.parent_id == trg_ctx.id)
              or (trg_ctx.user_id is none
                  and (now_ts - (zs.get('act_at', 0) | int(0)))
                      <= (self_action_grace | int))
