@@ -754,13 +754,43 @@ actions:
       # The grace-window test below cannot cover this: `mode: restart` cancels
       # the acting run before it writes `act_at`, so the re-entrant run reads
       # the PREVIOUS value. It stays only as a last resort for bridge actions.
+      # `context` must be read through a guard. It is NOT defined on every
+      # trigger path - on `reeval` it is absent - and an unguarded
+      # `context.parent_id` then yields LoggingUndefined, which makes the whole
+      # variables block raise
+      #   TypeError: Type is not JSON serializable: LoggingUndefined
+      # and ABORTS the run before any branch can act. Observed live 2026-09-21:
+      # Büro occupancy went on at 07:00:03 and the automation errored twice
+      # instead of switching the light on, in a dark room with every gate open.
+      # `| trim` is load-bearing. HA renders each variable to a STRING, and a
+      # folded (`>-`) block can leave a trailing newline - producing a 27-char
+      # id that never equals the 26-char real one, so every comparison below
+      # silently fails. Observed live: ctx_parent and trg_ctx.id printed
+      # identically in the trace while self_caused still evaluated False.
+      # Keep these on one line AND trimmed.
+      ctx_id: "{{ (context.id if context is defined and context is not none else '') | trim }}"
+      ctx_parent: "{{ (context.parent_id if context is defined and context is not none else '') | trim }}"
+      # Read trigger.to_state.context DIRECTLY here - do NOT go through the
+      # `trg_ctx` variable. HA renders every stored variable to a string, and a
+      # Context object becomes the literal text
+      #   <homeassistant.core.Context object at 0x...>
+      # whose `.id` is then Undefined, so every comparison below silently fails
+      # and the automation treats its own actions as human ones. `trg_ctx` is
+      # kept only for the `src` label in the branch below, where a string is
+      # harmless.
       self_caused: >-
-        {{ trg_ctx is not none
+        {% set tc = trigger.to_state.context
+                    if (trigger.to_state is defined and trigger.to_state is not none)
+                    else none %}
+        {% set tid  = (tc.id | string | trim) if tc is not none else '' %}
+        {% set tpar = (tc.parent_id | string | trim)
+                      if (tc is not none and tc.parent_id is not none) else '' %}
+        {{ tc is not none
            and (
-             trg_ctx.id == context.id
-             or (trg_ctx.parent_id is not none and trg_ctx.parent_id == context.id)
-             or (context.parent_id is not none and context.parent_id == trg_ctx.id)
-             or (trg_ctx.user_id is none
+             (ctx_id != '' and tid == ctx_id)
+             or (tpar != '' and ctx_id != '' and tpar == ctx_id)
+             or (ctx_parent != '' and ctx_parent == tid)
+             or (tc.user_id is none
                  and (now_ts - (zs.get('act_at', 0) | int(0)))
                      <= (self_action_grace | int))
            ) }}
@@ -808,8 +838,15 @@ actions:
         sequence:
           - variables:
               turned_on: "{{ trigger.id == 'light_on_external' }}"
+              # Same trap as self_caused: read the context directly. Via the
+              # stored `trg_ctx` string, `.user_id` is Undefined - which is
+              # never `none` - so every event was mislabelled `_ui`, including
+              # genuine bridge actions.
               src: >-
-                {{ 'ui' if trg_ctx.user_id is not none else 'bridge' }}
+                {% set tc = trigger.to_state.context
+                            if (trigger.to_state is defined and trigger.to_state is not none)
+                            else none %}
+                {{ 'ui' if (tc is not none and tc.user_id is not none) else 'bridge' }}
           - action: input_text.set_value
             target:
               entity_id: !input zone_state_helper
